@@ -29,6 +29,14 @@ springBoot {
     buildInfo()
 }
 
+tasks.named('bootJar') {
+    archiveFileName = 'payment-gateway.jar'
+}
+
+tasks.named('jar') {
+    enabled = false
+}
+
 tasks.named('test') {
     useJUnitPlatform()
 }
