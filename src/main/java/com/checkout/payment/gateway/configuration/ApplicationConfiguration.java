@@ -1,5 +1,6 @@
 package com.checkout.payment.gateway.configuration;
 
+import java.time.Clock;
 import java.time.Duration;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.context.annotation.Bean;
@@ -8,6 +9,11 @@ import org.springframework.web.client.RestTemplate;
 
 @Configuration
 public class ApplicationConfiguration {
+
+  @Bean
+  public Clock clock() {
+    return Clock.systemUTC();
+  }
 
   @Bean
   public RestTemplate restTemplate(RestTemplateBuilder builder) {
