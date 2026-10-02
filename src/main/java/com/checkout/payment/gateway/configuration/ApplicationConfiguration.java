@@ -1,7 +1,6 @@
 package com.checkout.payment.gateway.configuration;
 
 import java.time.Clock;
-import java.time.Duration;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -16,10 +15,11 @@ public class ApplicationConfiguration {
   }
 
   @Bean
-  public RestTemplate restTemplate(RestTemplateBuilder builder) {
+  public RestTemplate bankRestTemplate(RestTemplateBuilder builder, BankProperties bank) {
     return builder
-        .setConnectTimeout(Duration.ofMillis(10000))
-        .setReadTimeout(Duration.ofMillis(10000))
+        .rootUri(bank.url())
+        .setConnectTimeout(bank.connectTimeout())
+        .setReadTimeout(bank.readTimeout())
         .build();
   }
 }
