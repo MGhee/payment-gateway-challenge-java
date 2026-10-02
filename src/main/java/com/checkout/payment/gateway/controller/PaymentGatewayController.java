@@ -1,5 +1,6 @@
 package com.checkout.payment.gateway.controller;
 
+import com.checkout.payment.gateway.enums.PaymentStatus;
 import com.checkout.payment.gateway.model.ErrorResponse;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PaymentResponse;
@@ -13,6 +14,7 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.net.URI;
 import java.util.UUID;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -35,6 +37,8 @@ public class PaymentGatewayController {
   @PostMapping
   @Operation(summary = "Process a card payment")
   @ApiResponse(responseCode = "201", description = "Payment Authorized or Declined by the bank")
+  @ApiResponse(responseCode = "202", description = "Payment Pending: the bank outcome is unknown "
+      + "and the authorization is being reversed; poll the Location for the final status")
   @ApiResponse(responseCode = "400", description = "Payment Rejected; the bank was not called",
       content = @Content(schema = @Schema(implementation = ErrorResponse.class)))
   @ApiResponse(responseCode = "502", description = "Acquiring bank unavailable; no payment created",
@@ -42,7 +46,10 @@ public class PaymentGatewayController {
   public ResponseEntity<PaymentResponse> processPayment(
       @Valid @RequestBody PostPaymentRequest request) {
     Payment payment = paymentGatewayService.processPayment(request);
-    return ResponseEntity.created(URI.create("/payments/" + payment.id()))
+    HttpStatus status =
+        payment.status() == PaymentStatus.PENDING ? HttpStatus.ACCEPTED : HttpStatus.CREATED;
+    return ResponseEntity.status(status)
+        .location(URI.create("/payments/" + payment.id()))
         .body(PaymentResponse.from(payment));
   }
 

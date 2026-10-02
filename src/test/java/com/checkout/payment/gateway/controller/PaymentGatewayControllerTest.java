@@ -15,6 +15,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.checkout.payment.gateway.client.BankClient;
 import com.checkout.payment.gateway.client.BankPaymentResponse;
 import com.checkout.payment.gateway.exception.AcquiringBankException;
+import com.checkout.payment.gateway.exception.BankOutcomeUnknownException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jayway.jsonpath.JsonPath;
 import java.time.Year;
@@ -37,7 +38,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.ResultActions;
 
-@SpringBootTest
+@SpringBootTest(properties = "bank.reversal-retry-interval=PT1H")
 @AutoConfigureMockMvc
 class PaymentGatewayControllerTest {
 
@@ -52,7 +53,7 @@ class PaymentGatewayControllerTest {
 
   @Test
   void authorizedPaymentIsCreatedAndCanBeRetrieved() throws Exception {
-    when(bankClient.authorize(any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
 
     MvcResult created = postPayment(validRequest())
         .andExpect(status().isCreated())
@@ -81,17 +82,33 @@ class PaymentGatewayControllerTest {
 
   @Test
   void declinedPaymentIsCreatedWithDeclinedStatus() throws Exception {
-    when(bankClient.authorize(any())).thenReturn(new BankPaymentResponse(false, ""));
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(false, ""));
 
     postPayment(validRequest())
         .andExpect(status().isCreated())
         .andExpect(jsonPath("$.status").value("Declined"));
   }
 
+  @Test
+  void unknownBankOutcomeIsAcceptedAsPending() throws Exception {
+    when(bankClient.authorize(any(), any()))
+        .thenThrow(new BankOutcomeUnknownException("Read timed out"));
+
+    MvcResult accepted = postPayment(validRequest())
+        .andExpect(status().isAccepted())
+        .andExpect(header().string("Location", matchesPattern("/payments/[0-9a-f-]{36}")))
+        .andExpect(jsonPath("$.status").value("Pending"))
+        .andReturn();
+
+    mvc.perform(get(accepted.getResponse().getHeader("Location")))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.status").value("Pending"));
+  }
+
   @ParameterizedTest(name = "{0} = {1}")
   @MethodSource("boundaryValues")
   void boundaryValuesAreAccepted(String field, Object value) throws Exception {
-    when(bankClient.authorize(any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
     Map<String, Object> request = validRequest();
     request.put(field, value);
 
@@ -186,7 +203,8 @@ class PaymentGatewayControllerTest {
 
   @Test
   void bankFailureReturnsBadGateway() throws Exception {
-    when(bankClient.authorize(any())).thenThrow(new AcquiringBankException("Service Unavailable"));
+    when(bankClient.authorize(any(), any()))
+        .thenThrow(new AcquiringBankException("Service Unavailable"));
 
     postPayment(validRequest())
         .andExpect(status().isBadGateway())

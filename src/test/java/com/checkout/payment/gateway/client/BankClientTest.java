@@ -9,8 +9,11 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
 import com.checkout.payment.gateway.exception.AcquiringBankException;
+import com.checkout.payment.gateway.exception.BankOutcomeUnknownException;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
+import java.net.ConnectException;
 import java.net.SocketTimeoutException;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -22,6 +25,8 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
 
 class BankClientTest {
+
+  private static final UUID REFERENCE = UUID.fromString("6f1c2b9e-4d7a-4a5b-9c3e-1f2a3b4c5d6e");
 
   private final RestTemplate restTemplate = new RestTemplateBuilder().rootUri("http://bank").build();
   private final MockRestServiceServer bank = MockRestServiceServer.bindTo(restTemplate).build();
@@ -35,14 +40,15 @@ class BankClientTest {
     bank.expect(requestTo("http://bank/payments"))
         .andExpect(method(HttpMethod.POST))
         .andExpect(content().json("""
-            {"card_number": "2222405343248877", "expiry_date": "04/2030",
+            {"reference": "6f1c2b9e-4d7a-4a5b-9c3e-1f2a3b4c5d6e",
+             "card_number": "2222405343248877", "expiry_date": "04/2030",
              "currency": "GBP", "amount": 100, "cvv": "123"}
             """, true))
         .andRespond(withSuccess("""
             {"authorized": true, "authorization_code": "0bb07405-6d44-4b50-a14f-7ae0beff13ad"}
             """, MediaType.APPLICATION_JSON));
 
-    BankPaymentResponse response = bankClient.authorize(request);
+    BankPaymentResponse response = bankClient.authorize(REFERENCE, request);
 
     bank.verify();
     assertThat(response.authorized()).isTrue();
@@ -56,27 +62,71 @@ class BankClientTest {
             {"authorized": false, "authorization_code": ""}
             """, MediaType.APPLICATION_JSON));
 
-    assertThat(bankClient.authorize(request).authorized()).isFalse();
+    assertThat(bankClient.authorize(REFERENCE, request).authorized()).isFalse();
   }
 
   @ParameterizedTest
   @ValueSource(ints = {400, 500, 503})
-  void bankErrorResponseIsReportedAsBankFailure(int status) {
+  void bankErrorResponseMeansNothingWasAuthorized(int status) {
     bank.expect(requestTo("http://bank/payments"))
         .andRespond(withStatus(HttpStatusCode.valueOf(status)));
 
-    assertThatThrownBy(() -> bankClient.authorize(request))
+    assertThatThrownBy(() -> bankClient.authorize(REFERENCE, request))
         .isInstanceOf(AcquiringBankException.class);
   }
 
   @Test
-  void bankTimeoutIsReportedAsBankFailure() {
+  void unreachableBankMeansNothingWasAuthorized() {
+    bank.expect(requestTo("http://bank/payments"))
+        .andRespond(req -> {
+          throw new ConnectException("Connection refused");
+        });
+
+    assertThatThrownBy(() -> bankClient.authorize(REFERENCE, request))
+        .isInstanceOf(AcquiringBankException.class);
+  }
+
+  @Test
+  void timeoutMakesTheOutcomeUnknown() {
     bank.expect(requestTo("http://bank/payments"))
         .andRespond(req -> {
           throw new SocketTimeoutException("Read timed out");
         });
 
-    assertThatThrownBy(() -> bankClient.authorize(request))
+    assertThatThrownBy(() -> bankClient.authorize(REFERENCE, request))
+        .isInstanceOf(BankOutcomeUnknownException.class);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"", "not json"})
+  void unreadableSuccessResponseMakesTheOutcomeUnknown(String body) {
+    bank.expect(requestTo("http://bank/payments"))
+        .andRespond(withSuccess(body, MediaType.APPLICATION_JSON));
+
+    assertThatThrownBy(() -> bankClient.authorize(REFERENCE, request))
+        .isInstanceOf(BankOutcomeUnknownException.class);
+  }
+
+  @Test
+  void reversesThePaymentByReference() {
+    bank.expect(requestTo("http://bank/reversals"))
+        .andExpect(method(HttpMethod.POST))
+        .andExpect(content().json("""
+            {"reference": "6f1c2b9e-4d7a-4a5b-9c3e-1f2a3b4c5d6e"}
+            """, true))
+        .andRespond(withSuccess());
+
+    bankClient.reverse(REFERENCE);
+
+    bank.verify();
+  }
+
+  @Test
+  void failedReversalIsReported() {
+    bank.expect(requestTo("http://bank/reversals"))
+        .andRespond(withStatus(HttpStatusCode.valueOf(400)));
+
+    assertThatThrownBy(() -> bankClient.reverse(REFERENCE))
         .isInstanceOf(AcquiringBankException.class);
   }
 }
