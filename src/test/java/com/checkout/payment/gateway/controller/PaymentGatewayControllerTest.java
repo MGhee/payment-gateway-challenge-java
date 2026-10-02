@@ -4,6 +4,8 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -211,6 +213,37 @@ class PaymentGatewayControllerTest {
         .andExpect(jsonPath("$.message").value("Acquiring bank unavailable, please retry later"));
   }
 
+  @Test
+  void retryWithTheSameIdempotencyKeyReturnsTheSamePayment() throws Exception {
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    String key = UUID.randomUUID().toString();
+
+    String originalId = JsonPath.read(postPayment(validRequest(), key)
+        .andExpect(status().isCreated())
+        .andReturn().getResponse().getContentAsString(), "$.id");
+
+    postPayment(validRequest(), key)
+        .andExpect(status().isCreated())
+        .andExpect(jsonPath("$.id").value(originalId))
+        .andExpect(jsonPath("$.status").value("Authorized"));
+    verify(bankClient, times(1)).authorize(any(), any());
+  }
+
+  @Test
+  void idempotencyKeyReusedForADifferentPaymentIsUnprocessable() throws Exception {
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    String key = UUID.randomUUID().toString();
+    postPayment(validRequest(), key).andExpect(status().isCreated());
+
+    Map<String, Object> differentAmount = validRequest();
+    differentAmount.put("amount", 9999);
+
+    postPayment(differentAmount, key)
+        .andExpect(status().isUnprocessableEntity())
+        .andExpect(jsonPath("$.message")
+            .value("This Idempotency-Key was already used for a different payment"));
+  }
+
   @ParameterizedTest
   @ValueSource(strings = {"6f1c2b9e-4d7a-4a5b-9c3e-1f2a3b4c5d6e", "not-a-uuid"})
   void unknownPaymentReturnsNotFound(String id) throws Exception {
@@ -244,6 +277,14 @@ class PaymentGatewayControllerTest {
 
   private ResultActions postPayment(Map<String, Object> request) throws Exception {
     return mvc.perform(post("/payments")
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(objectMapper.writeValueAsString(request)));
+  }
+
+  private ResultActions postPayment(Map<String, Object> request, String idempotencyKey)
+      throws Exception {
+    return mvc.perform(post("/payments")
+        .header("Idempotency-Key", idempotencyKey)
         .contentType(MediaType.APPLICATION_JSON)
         .content(objectMapper.writeValueAsString(request)));
   }

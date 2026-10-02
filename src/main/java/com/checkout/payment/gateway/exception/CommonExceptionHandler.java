@@ -54,6 +54,20 @@ public class CommonExceptionHandler {
         .body(ErrorResponse.of("Acquiring bank unavailable, please retry later"));
   }
 
+  @ExceptionHandler(IdempotencyConflictException.class)
+  public ResponseEntity<ErrorResponse> handleIdempotencyConflict(IdempotencyConflictException ex) {
+    LOG.info("Duplicate request rejected: {}", ex.getMessage());
+    return ResponseEntity.status(HttpStatus.CONFLICT)
+        .body(ErrorResponse.of("A request with this Idempotency-Key is still being processed"));
+  }
+
+  @ExceptionHandler(IdempotencyKeyReusedException.class)
+  public ResponseEntity<ErrorResponse> handleIdempotencyKeyReused(IdempotencyKeyReusedException ex) {
+    LOG.info("Duplicate request rejected: {}", ex.getMessage());
+    return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+        .body(ErrorResponse.of("This Idempotency-Key was already used for a different payment"));
+  }
+
   // Field errors use the JSON property names the merchant actually sent
   private static String describe(ObjectError error) {
     if (error instanceof FieldError fieldError) {

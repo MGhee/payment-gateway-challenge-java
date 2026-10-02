@@ -10,9 +10,10 @@ public record Payment(
     int expiryMonth,
     int expiryYear,
     String currency,
-    int amount) {
+    int amount,
+    String idempotencyKey) {
 
-  public static Payment pending(PostPaymentRequest request) {
+  public static Payment pending(PostPaymentRequest request, String idempotencyKey) {
     return new Payment(
         UUID.randomUUID(),
         PaymentStatus.PENDING,
@@ -20,10 +21,21 @@ public record Payment(
         request.expiryMonth(),
         request.expiryYear(),
         request.currency(),
-        request.amount());
+        request.amount(),
+        idempotencyKey);
   }
 
   public Payment withStatus(PaymentStatus newStatus) {
-    return new Payment(id, newStatus, cardNumberLastFour, expiryMonth, expiryYear, currency, amount);
+    return new Payment(id, newStatus, cardNumberLastFour, expiryMonth, expiryYear, currency, amount,
+        idempotencyKey);
+  }
+
+  // Card number and CVV are never stored, so a retry is matched on the fields we keep
+  public boolean matches(PostPaymentRequest request) {
+    return cardNumberLastFour.equals(request.cardNumberLastFour())
+        && expiryMonth == request.expiryMonth()
+        && expiryYear == request.expiryYear()
+        && currency.equals(request.currency())
+        && amount == request.amount();
   }
 }

@@ -30,7 +30,7 @@ class PaymentReversalJobTest {
       meterRegistry, new BankProperties("http://bank", Duration.ZERO, Duration.ZERO, MAX_ATTEMPTS));
 
   private final Payment pending = Payment.pending(
-      new PostPaymentRequest("2222405343248877", 4, 2030, "GBP", 100, "123"));
+      new PostPaymentRequest("2222405343248877", 4, 2030, "GBP", 100, "123"), null);
 
   @BeforeEach
   void scheduleReversalOfPendingPayment() {
