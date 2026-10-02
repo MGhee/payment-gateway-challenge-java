@@ -47,7 +47,7 @@ public class BankClient {
     try {
       restTemplate.postForEntity("/reversals", new BankReversalRequest(reference), Void.class);
     } catch (RestClientException e) {
-      throw new AcquiringBankException("Reversal failed", e);
+      throw new AcquiringBankException("Reversal failed: " + e.getMessage(), e);
     }
   }
 }
