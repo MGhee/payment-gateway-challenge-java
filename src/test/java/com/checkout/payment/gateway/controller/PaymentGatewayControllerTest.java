@@ -21,6 +21,7 @@ import java.time.Year;
 import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -198,6 +199,18 @@ class PaymentGatewayControllerTest {
     mvc.perform(get("/payments/" + id))
         .andExpect(status().isNotFound())
         .andExpect(jsonPath("$.message").value("Payment not found"));
+  }
+
+  @Test
+  void requestIdIsEchoedBack() throws Exception {
+    mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-Request-Id", "merchant-req-42"))
+        .andExpect(header().string("X-Request-Id", "merchant-req-42"));
+  }
+
+  @Test
+  void unsafeRequestIdIsReplaced() throws Exception {
+    mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-Request-Id", "id\nforged log"))
+        .andExpect(header().string("X-Request-Id", matchesPattern("[0-9a-f-]{36}")));
   }
 
   private Map<String, Object> validRequest() {

@@ -6,6 +6,7 @@ import com.checkout.payment.gateway.exception.PaymentNotFoundException;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import com.checkout.payment.gateway.repository.PaymentsRepository;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,10 +19,13 @@ public class PaymentGatewayService {
 
   private final PaymentsRepository paymentsRepository;
   private final BankClient bankClient;
+  private final MeterRegistry meterRegistry;
 
-  public PaymentGatewayService(PaymentsRepository paymentsRepository, BankClient bankClient) {
+  public PaymentGatewayService(PaymentsRepository paymentsRepository, BankClient bankClient,
+      MeterRegistry meterRegistry) {
     this.paymentsRepository = paymentsRepository;
     this.bankClient = bankClient;
+    this.meterRegistry = meterRegistry;
   }
 
   public Payment processPayment(PostPaymentRequest request) {
@@ -38,6 +42,7 @@ public class PaymentGatewayService {
         request.amount());
     paymentsRepository.add(payment);
 
+    meterRegistry.counter("payments.processed", "status", status.getName()).increment();
     LOG.info("Payment {} {}: {} {}", payment.id(), status.getName(), payment.amount(),
         payment.currency());
     return payment;

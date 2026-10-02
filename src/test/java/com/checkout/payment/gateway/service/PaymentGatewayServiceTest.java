@@ -17,6 +17,7 @@ import com.checkout.payment.gateway.exception.PaymentNotFoundException;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import com.checkout.payment.gateway.repository.PaymentsRepository;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
@@ -24,7 +25,9 @@ class PaymentGatewayServiceTest {
 
   private final BankClient bankClient = mock(BankClient.class);
   private final PaymentsRepository repository = spy(new PaymentsRepository());
-  private final PaymentGatewayService service = new PaymentGatewayService(repository, bankClient);
+  private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+  private final PaymentGatewayService service =
+      new PaymentGatewayService(repository, bankClient, meterRegistry);
 
   private final PostPaymentRequest request =
       new PostPaymentRequest("4000000000000123", 4, 2030, "USD", 1050, "123");
@@ -42,6 +45,7 @@ class PaymentGatewayServiceTest {
     assertThat(payment.currency()).isEqualTo("USD");
     assertThat(payment.amount()).isEqualTo(1050);
     assertThat(service.getPayment(payment.id())).isEqualTo(payment);
+    assertThat(processedCount("Authorized")).isEqualTo(1);
   }
 
   @Test
@@ -52,6 +56,7 @@ class PaymentGatewayServiceTest {
 
     assertThat(payment.status()).isEqualTo(PaymentStatus.DECLINED);
     assertThat(service.getPayment(payment.id())).isEqualTo(payment);
+    assertThat(processedCount("Declined")).isEqualTo(1);
   }
 
   @Test
@@ -67,5 +72,9 @@ class PaymentGatewayServiceTest {
   void unknownPaymentIsNotFound() {
     assertThatThrownBy(() -> service.getPayment(UUID.randomUUID()))
         .isInstanceOf(PaymentNotFoundException.class);
+  }
+
+  private double processedCount(String status) {
+    return meterRegistry.counter("payments.processed", "status", status).count();
   }
 }
