@@ -1,9 +1,15 @@
 package com.checkout.payment.gateway.controller;
 
+import com.checkout.payment.gateway.model.ErrorResponse;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PaymentResponse;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import com.checkout.payment.gateway.service.PaymentGatewayService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.net.URI;
 import java.util.UUID;
@@ -17,6 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/payments")
+@Tag(name = "Payments")
 public class PaymentGatewayController {
 
   private final PaymentGatewayService paymentGatewayService;
@@ -26,6 +33,12 @@ public class PaymentGatewayController {
   }
 
   @PostMapping
+  @Operation(summary = "Process a card payment")
+  @ApiResponse(responseCode = "201", description = "Payment Authorized or Declined by the bank")
+  @ApiResponse(responseCode = "400", description = "Payment Rejected; the bank was not called",
+      content = @Content(schema = @Schema(implementation = ErrorResponse.class)))
+  @ApiResponse(responseCode = "502", description = "Acquiring bank unavailable; no payment created",
+      content = @Content(schema = @Schema(implementation = ErrorResponse.class)))
   public ResponseEntity<PaymentResponse> processPayment(
       @Valid @RequestBody PostPaymentRequest request) {
     Payment payment = paymentGatewayService.processPayment(request);
@@ -34,6 +47,10 @@ public class PaymentGatewayController {
   }
 
   @GetMapping("/{id}")
+  @Operation(summary = "Retrieve a previously processed payment")
+  @ApiResponse(responseCode = "200", description = "Payment found")
+  @ApiResponse(responseCode = "404", description = "Payment not found",
+      content = @Content(schema = @Schema(implementation = ErrorResponse.class)))
   public PaymentResponse getPayment(@PathVariable UUID id) {
     return PaymentResponse.from(paymentGatewayService.getPayment(id));
   }
