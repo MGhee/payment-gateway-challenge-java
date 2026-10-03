@@ -5,6 +5,7 @@ import com.checkout.payment.gateway.model.Payment;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -13,6 +14,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -24,24 +28,37 @@ public class PaymentsRepository implements PaymentStore {
       + "authorization_in_progress, reversal_attempts, next_reversal_at";
 
   private final JdbcTemplate jdbcTemplate;
+  private final TransactionTemplate transactionTemplate;
+  private final java.time.Clock clock;
+  private final Duration idempotencyRetention;
 
-  public PaymentsRepository(JdbcTemplate jdbcTemplate) {
+  public PaymentsRepository(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager,
+      java.time.Clock clock,
+      @Value("${gateway.idempotency-retention:PT72H}") Duration idempotencyRetention) {
     this.jdbcTemplate = jdbcTemplate;
+    this.transactionTemplate = new TransactionTemplate(transactionManager);
+    this.clock = clock;
+    this.idempotencyRetention = idempotencyRetention;
   }
 
   @Override
   public Optional<Payment> addIfKeyUnused(Payment payment) {
-    String sql = "INSERT INTO payments (" + COLUMNS
-        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    if (payment.idempotencyKey() == null) {
+      insertPayment(payment);
+      return Optional.empty();
+    }
     try {
-      jdbcTemplate.update(sql, payment.id(), payment.merchantId(), payment.status().name(),
-          payment.cardNumberLastFour(), payment.expiryMonth(), payment.expiryYear(),
-          payment.currency(), payment.amount(), payment.idempotencyKey(),
-          Timestamp.from(payment.createdAt()), payment.authorizationInProgress(),
-          payment.reversalAttempts(), timestamp(payment.nextReversalAt()));
+      transactionTemplate.executeWithoutResult(transaction -> {
+        Instant now = clock.instant();
+        clearExpiredIdempotencyKey(payment.merchantId(), payment.idempotencyKey(), now);
+        insertPayment(payment);
+        jdbcTemplate.update("INSERT INTO payment_idempotency_keys "
+                + "(merchant_id, idempotency_key, payment_id, expires_at) VALUES (?, ?, ?, ?)",
+            payment.merchantId(), payment.idempotencyKey(), payment.id(),
+            Timestamp.from(now.plus(idempotencyRetention)));
+      });
     } catch (DuplicateKeyException e) {
-      Optional<Payment> original = payment.idempotencyKey() == null ? Optional.empty()
-          : getByIdempotencyKey(payment.merchantId(), payment.idempotencyKey());
+      Optional<Payment> original = getByIdempotencyKey(payment.merchantId(), payment.idempotencyKey());
       if (original.isPresent()) {
         return original;
       }
@@ -75,8 +92,10 @@ public class PaymentsRepository implements PaymentStore {
 
   @Override
   public Optional<Payment> getByIdempotencyKey(String merchantId, String idempotencyKey) {
-    return queryOne("SELECT " + COLUMNS + " FROM payments WHERE merchant_id = ? "
-        + "AND idempotency_key = ?", merchantId, idempotencyKey);
+    return queryOne("SELECT p." + COLUMNS.replace(", ", ", p.") + " FROM payments p "
+        + "JOIN payment_idempotency_keys k ON k.payment_id = p.id "
+        + "WHERE k.merchant_id = ? AND k.idempotency_key = ? AND k.expires_at > ?",
+      merchantId, idempotencyKey, Timestamp.from(clock.instant()));
   }
 
   @Override
@@ -107,6 +126,37 @@ public class PaymentsRepository implements PaymentStore {
             + "next_reversal_at = ? WHERE status = ? AND authorization_in_progress = TRUE "
             + "AND created_at < ?",
         Timestamp.from(retryAt), PaymentStatus.PENDING.name(), Timestamp.from(startedBefore));
+  }
+
+  @Override
+  @Transactional
+  public int purgeExpiredIdempotencyKeys(Instant now) {
+    jdbcTemplate.update("UPDATE payments SET idempotency_key = NULL WHERE id IN "
+        + "(SELECT payment_id FROM payment_idempotency_keys WHERE expires_at <= ?)",
+      Timestamp.from(now));
+    return jdbcTemplate.update("DELETE FROM payment_idempotency_keys WHERE expires_at <= ?",
+        Timestamp.from(now));
+  }
+
+    private void clearExpiredIdempotencyKey(String merchantId, String idempotencyKey, Instant now) {
+    Timestamp timestamp = Timestamp.from(now);
+    jdbcTemplate.update("UPDATE payments SET idempotency_key = NULL WHERE id IN "
+        + "(SELECT payment_id FROM payment_idempotency_keys WHERE merchant_id = ? "
+        + "AND idempotency_key = ? AND expires_at <= ?)",
+      merchantId, idempotencyKey, timestamp);
+    jdbcTemplate.update("DELETE FROM payment_idempotency_keys WHERE merchant_id = ? "
+        + "AND idempotency_key = ? AND expires_at <= ?",
+      merchantId, idempotencyKey, timestamp);
+    }
+
+  private void insertPayment(Payment payment) {
+    String sql = "INSERT INTO payments (" + COLUMNS
+        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    jdbcTemplate.update(sql, payment.id(), payment.merchantId(), payment.status().name(),
+        payment.cardNumberLastFour(), payment.expiryMonth(), payment.expiryYear(),
+        payment.currency(), payment.amount(), payment.idempotencyKey(),
+        Timestamp.from(payment.createdAt()), payment.authorizationInProgress(),
+        payment.reversalAttempts(), timestamp(payment.nextReversalAt()));
   }
 
   private Optional<Payment> queryOne(String sql, Object... args) {

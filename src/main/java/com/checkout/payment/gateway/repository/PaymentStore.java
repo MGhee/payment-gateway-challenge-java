@@ -25,4 +25,6 @@ public interface PaymentStore {
   List<Payment> findCreatedBetween(Instant startInclusive, Instant endExclusive);
 
   int recoverStaleAuthorizations(Instant startedBefore, Instant retryAt);
+
+  int purgeExpiredIdempotencyKeys(Instant now);
 }

@@ -1,7 +1,9 @@
 package com.checkout.payment.gateway.exception;
 
 import com.checkout.payment.gateway.model.ErrorResponse;
+import com.checkout.payment.gateway.service.MerchantCredentialNotFoundException;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,56 +25,73 @@ public class CommonExceptionHandler {
       new PropertyNamingStrategies.SnakeCaseStrategy();
 
   @ExceptionHandler(MethodArgumentNotValidException.class)
-  public ResponseEntity<ErrorResponse> handleInvalidRequest(MethodArgumentNotValidException ex) {
+  public ResponseEntity<Object> handleInvalidRequest(MethodArgumentNotValidException ex,
+      HttpServletRequest request) {
     List<String> errors = ex.getBindingResult().getAllErrors().stream()
         .map(CommonExceptionHandler::describe)
         .sorted()
         .toList();
     LOG.info("Payment rejected: {}", errors);
-    return ResponseEntity.badRequest()
-        .body(ErrorResponse.rejected("Invalid payment request", errors));
+    return ProblemDetails.response(HttpStatus.BAD_REQUEST,
+        ErrorResponse.rejected("Invalid payment request", errors), "invalid-payment-request",
+        "Invalid payment request", errors, request);
   }
 
   @ExceptionHandler(HttpMessageNotReadableException.class)
-  public ResponseEntity<ErrorResponse> handleUnreadableRequest(HttpMessageNotReadableException ex) {
+  public ResponseEntity<Object> handleUnreadableRequest(HttpMessageNotReadableException ex,
+      HttpServletRequest request) {
     LOG.info("Payment rejected: malformed request body");
-    return ResponseEntity.badRequest()
-        .body(ErrorResponse.rejected("Malformed request body", null));
+    return ProblemDetails.response(HttpStatus.BAD_REQUEST,
+        ErrorResponse.rejected("Malformed request body", null), "malformed-request",
+        "Malformed request body", null, request);
   }
 
-  @ExceptionHandler({PaymentNotFoundException.class, MethodArgumentTypeMismatchException.class})
-  public ResponseEntity<ErrorResponse> handleNotFound(Exception ex) {
+  @ExceptionHandler({PaymentNotFoundException.class, MerchantCredentialNotFoundException.class,
+      MethodArgumentTypeMismatchException.class})
+  public ResponseEntity<Object> handleNotFound(Exception ex, HttpServletRequest request) {
     LOG.info("Payment not found: {}", ex.getMessage());
-    return ResponseEntity.status(HttpStatus.NOT_FOUND)
-        .body(ErrorResponse.of("Payment not found"));
+    String detail = ex instanceof MerchantCredentialNotFoundException
+        ? "Merchant API key not found" : "Payment not found";
+    return ProblemDetails.response(HttpStatus.NOT_FOUND, ErrorResponse.of(detail), "not-found",
+        detail, null, request);
   }
 
   @ExceptionHandler(AcquiringBankException.class)
-  public ResponseEntity<ErrorResponse> handleBankFailure(AcquiringBankException ex) {
+  public ResponseEntity<Object> handleBankFailure(AcquiringBankException ex,
+      HttpServletRequest request) {
     LOG.error("Payment failed: acquiring bank unavailable", ex);
-    return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-        .body(ErrorResponse.of("Acquiring bank unavailable, please retry later"));
+    String detail = "Acquiring bank unavailable, please retry later";
+    return ProblemDetails.response(HttpStatus.BAD_GATEWAY, ErrorResponse.of(detail),
+        "acquiring-bank-unavailable", detail, null, request);
   }
 
   @ExceptionHandler(IdempotencyConflictException.class)
-  public ResponseEntity<ErrorResponse> handleIdempotencyConflict(IdempotencyConflictException ex) {
+  public ResponseEntity<Object> handleIdempotencyConflict(IdempotencyConflictException ex,
+      HttpServletRequest request) {
     LOG.info("Duplicate request rejected: {}", ex.getMessage());
-    return ResponseEntity.status(HttpStatus.CONFLICT)
-        .body(ErrorResponse.of("A request with this Idempotency-Key is still being processed"));
+    String detail = "A request with this Idempotency-Key is still being processed";
+    return ProblemDetails.response(HttpStatus.CONFLICT, ErrorResponse.of(detail),
+        "idempotency-request-in-progress", detail, null, request);
   }
 
   @ExceptionHandler(IdempotencyKeyReusedException.class)
-  public ResponseEntity<ErrorResponse> handleIdempotencyKeyReused(IdempotencyKeyReusedException ex) {
+  public ResponseEntity<Object> handleIdempotencyKeyReused(IdempotencyKeyReusedException ex,
+      HttpServletRequest request) {
     LOG.info("Duplicate request rejected: {}", ex.getMessage());
-    return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
-        .body(ErrorResponse.of("This Idempotency-Key was already used for a different payment"));
+    String detail = "This Idempotency-Key was already used for a different payment";
+    return ProblemDetails.response(HttpStatus.UNPROCESSABLE_ENTITY, ErrorResponse.of(detail),
+        "idempotency-key-reused", detail, null, request);
   }
 
   // Field errors use the JSON property names the merchant actually sent
   private static String describe(ObjectError error) {
+    if (error == null) {
+      return "Invalid request";
+    }
     if (error instanceof FieldError fieldError) {
       return SNAKE_CASE.translate(fieldError.getField()) + " " + fieldError.getDefaultMessage();
     }
-    return error.getDefaultMessage();
+    String message = error.getDefaultMessage();
+    return message == null ? "Invalid request" : message;
   }
 }

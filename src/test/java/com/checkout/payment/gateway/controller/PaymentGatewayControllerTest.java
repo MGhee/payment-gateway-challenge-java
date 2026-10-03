@@ -1,5 +1,6 @@
 package com.checkout.payment.gateway.controller;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.matchesPattern;
@@ -10,6 +11,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -22,11 +24,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jayway.jsonpath.JsonPath;
 import java.time.Year;
 import java.time.ZoneOffset;
+import java.sql.Timestamp;
+import java.sql.Timestamp;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -36,6 +41,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.ResultActions;
@@ -50,8 +56,24 @@ class PaymentGatewayControllerTest {
   private MockMvc mvc;
   @Autowired
   private ObjectMapper objectMapper;
+  @Autowired
+  private JdbcTemplate jdbcTemplate;
   @MockBean
   private BankClient bankClient;
+  private String merchantApiKey;
+
+  @BeforeEach
+  void provisionTestMerchant() throws Exception {
+    merchantApiKey = provisionMerchant("test-merchant");
+  }
+
+  private String provisionMerchant(String merchantId) throws Exception {
+    String body = mvc.perform(post("/admin/merchants/" + merchantId + "/api-keys")
+            .header("X-Gateway-Admin-Key", "test-admin-secret"))
+        .andExpect(status().isCreated())
+        .andReturn().getResponse().getContentAsString();
+    return JsonPath.read(body, "$.api_key");
+  }
 
   @Test
   void authorizedPaymentIsCreatedAndCanBeRetrieved() throws Exception {
@@ -71,7 +93,7 @@ class PaymentGatewayControllerTest {
         .andReturn();
 
     String id = JsonPath.read(created.getResponse().getContentAsString(), "$.id");
-    mvc.perform(get(created.getResponse().getHeader("Location")).header("X-API-Key", "test-secret"))
+    mvc.perform(get(created.getResponse().getHeader("Location")).header("X-API-Key", merchantApiKey))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.id").value(id))
         .andExpect(jsonPath("$.status").value("Authorized"))
@@ -102,7 +124,7 @@ class PaymentGatewayControllerTest {
         .andExpect(jsonPath("$.status").value("Pending"))
         .andReturn();
 
-    mvc.perform(get(accepted.getResponse().getHeader("Location")).header("X-API-Key", "test-secret"))
+    mvc.perform(get(accepted.getResponse().getHeader("Location")).header("X-API-Key", merchantApiKey))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.status").value("Pending"));
   }
@@ -169,7 +191,7 @@ class PaymentGatewayControllerTest {
   @Test
   void everyMissingFieldIsReported() throws Exception {
     mvc.perform(post("/payments")
-      .header("X-API-Key", "test-secret")
+      .header("X-API-Key", merchantApiKey)
       .contentType(MediaType.APPLICATION_JSON)
       .content("{}"))
         .andExpect(status().isBadRequest())
@@ -200,7 +222,7 @@ class PaymentGatewayControllerTest {
   @ValueSource(strings = {"", "not json", "{\"expiry_month\": \"April\"}"})
   void malformedBodyIsRejectedWithoutCallingTheBank(String body) throws Exception {
     mvc.perform(post("/payments")
-      .header("X-API-Key", "test-secret")
+      .header("X-API-Key", merchantApiKey)
       .contentType(MediaType.APPLICATION_JSON)
       .content(body))
         .andExpect(status().isBadRequest())
@@ -234,18 +256,69 @@ class PaymentGatewayControllerTest {
     mvc.perform(get("/v3/api-docs"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.components.securitySchemes.MerchantApiKey.name")
-            .value("X-API-Key"));
+        .value("X-API-Key"))
+      .andExpect(jsonPath("$.components.securitySchemes.GatewayAdminKey.name")
+        .value("X-Gateway-Admin-Key"));
   }
+
+  @Test
+  void merchantKeysAreStoredAsHashes() {
+    assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM merchant_api_keys "
+        + "WHERE key_hash = ?", Long.class, merchantApiKey)).isZero();
+    assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM merchant_api_keys "
+        + "WHERE key_prefix = ?", Long.class, merchantApiKey.substring(0, 12))).isEqualTo(1);
+  }
+
+  @Test
+  void credentialAdministrationRequiresTheAdminKey() throws Exception {
+    mvc.perform(post("/admin/merchants/new-merchant/api-keys"))
+        .andExpect(status().isUnauthorized())
+        .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+        .andExpect(jsonPath("$.type")
+            .value("urn:payment-gateway:problem:admin-authentication-required"));
+  }
+
+    @Test
+    void versionedApiUsesVersionedLocationAndProblemDetails() throws Exception {
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    MvcResult created = postVersionedPayment(validRequest())
+      .andExpect(status().isCreated())
+      .andExpect(header().string("Location", matchesPattern("/v1/payments/[0-9a-f-]{36}")))
+      .andReturn();
+    String id = JsonPath.read(created.getResponse().getContentAsString(), "$.id");
+    mvc.perform(get("/v1/payments/" + id).header("X-API-Key", merchantApiKey))
+      .andExpect(status().isOk())
+      .andExpect(jsonPath("$.id").value(id));
+
+    mvc.perform(post("/v1/payments")
+      .contentType(MediaType.APPLICATION_JSON)
+      .content(objectMapper.writeValueAsString(validRequest())))
+      .andExpect(status().isUnauthorized())
+      .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+      .andExpect(jsonPath("$.status").value(401));
+
+    Map<String, Object> invalidRequest = validRequest();
+    invalidRequest.put("amount", 0);
+    postVersionedPayment(invalidRequest)
+      .andExpect(status().isBadRequest())
+      .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+      .andExpect(jsonPath("$.type").value("urn:payment-gateway:problem:invalid-payment-request"))
+      .andExpect(jsonPath("$.title").value("Bad Request"))
+      .andExpect(jsonPath("$.status").value(400))
+      .andExpect(jsonPath("$.detail").value("Invalid payment request"))
+      .andExpect(jsonPath("$.errors[0]").value("amount must be greater than 0"));
+    }
 
   @Test
   void merchantCannotRetrieveAnotherMerchantsPayment() throws Exception {
     when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    String otherMerchantApiKey = provisionMerchant("other-merchant");
     MvcResult created = postPayment(validRequest())
         .andExpect(status().isCreated())
         .andReturn();
 
     mvc.perform(get("/payments/" + JsonPath.read(created.getResponse().getContentAsString(), "$.id"))
-        .header("X-API-Key", "other-secret"))
+        .header("X-API-Key", otherMerchantApiKey))
         .andExpect(status().isNotFound());
   }
 
@@ -280,10 +353,60 @@ class PaymentGatewayControllerTest {
             .value("This Idempotency-Key was already used for a different payment"));
   }
 
+        @Test
+        void expiredIdempotencyKeyCanBeUsedForANewPayment() throws Exception {
+        when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+        String key = UUID.randomUUID().toString();
+        String firstId = JsonPath.read(postPayment(validRequest(), key)
+          .andExpect(status().isCreated())
+          .andReturn().getResponse().getContentAsString(), "$.id");
+        jdbcTemplate.update("UPDATE payment_idempotency_keys SET expires_at = ? "
+          + "WHERE merchant_id = ? AND idempotency_key = ?",
+          Timestamp.from(java.time.Instant.now().minusSeconds(1)), "test-merchant", key);
+
+        String secondId = JsonPath.read(postPayment(validRequest(), key)
+          .andExpect(status().isCreated())
+          .andReturn().getResponse().getContentAsString(), "$.id");
+
+        org.assertj.core.api.Assertions.assertThat(secondId).isNotEqualTo(firstId);
+        assertThat(jdbcTemplate.queryForObject("SELECT idempotency_key FROM payments WHERE id = ?",
+          String.class, UUID.fromString(firstId))).isNull();
+        verify(bankClient, times(2)).authorize(any(), any());
+        }
+
+        @Test
+        void merchantCredentialsCanBeRotatedAndRevoked() throws Exception {
+        String path = "/admin/merchants/lifecycle/api-keys";
+        MvcResult provisioned = mvc.perform(post(path)
+          .header("X-Gateway-Admin-Key", "test-admin-secret"))
+          .andExpect(status().isCreated())
+          .andReturn();
+        String originalKey = JsonPath.read(provisioned.getResponse().getContentAsString(), "$.api_key");
+        String keyId = JsonPath.read(provisioned.getResponse().getContentAsString(), "$.key_id");
+
+        MvcResult rotated = mvc.perform(post(path + "/" + keyId + "/rotate")
+          .header("X-Gateway-Admin-Key", "test-admin-secret"))
+          .andExpect(status().isOk())
+          .andReturn();
+        String replacementKey = JsonPath.read(rotated.getResponse().getContentAsString(), "$.api_key");
+        String replacementId = JsonPath.read(rotated.getResponse().getContentAsString(), "$.key_id");
+
+        mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-API-Key", originalKey))
+          .andExpect(status().isUnauthorized());
+        mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-API-Key", replacementKey))
+          .andExpect(status().isNotFound());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+          .delete(path + "/" + replacementId)
+          .header("X-Gateway-Admin-Key", "test-admin-secret"))
+          .andExpect(status().isNoContent());
+        mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-API-Key", replacementKey))
+          .andExpect(status().isUnauthorized());
+        }
+
   @ParameterizedTest
   @ValueSource(strings = {"6f1c2b9e-4d7a-4a5b-9c3e-1f2a3b4c5d6e", "not-a-uuid"})
   void unknownPaymentReturnsNotFound(String id) throws Exception {
-    mvc.perform(get("/payments/" + id).header("X-API-Key", "test-secret"))
+    mvc.perform(get("/payments/" + id).header("X-API-Key", merchantApiKey))
         .andExpect(status().isNotFound())
         .andExpect(jsonPath("$.message").value("Payment not found"));
   }
@@ -291,7 +414,7 @@ class PaymentGatewayControllerTest {
   @Test
   void requestIdIsEchoedBack() throws Exception {
     mvc.perform(get("/payments/" + UUID.randomUUID())
-      .header("X-API-Key", "test-secret")
+      .header("X-API-Key", merchantApiKey)
       .header("X-Request-Id", "merchant-req-42"))
         .andExpect(header().string("X-Request-Id", "merchant-req-42"));
   }
@@ -299,7 +422,7 @@ class PaymentGatewayControllerTest {
   @Test
   void unsafeRequestIdIsReplaced() throws Exception {
     mvc.perform(get("/payments/" + UUID.randomUUID())
-      .header("X-API-Key", "test-secret")
+      .header("X-API-Key", merchantApiKey)
       .header("X-Request-Id", "id\nforged log"))
         .andExpect(header().string("X-Request-Id", matchesPattern("[0-9a-f-]{36}")));
   }
@@ -317,7 +440,7 @@ class PaymentGatewayControllerTest {
 
   private ResultActions postPayment(Map<String, Object> request) throws Exception {
     return mvc.perform(post("/payments")
-        .header("X-API-Key", "test-secret")
+        .header("X-API-Key", merchantApiKey)
         .contentType(MediaType.APPLICATION_JSON)
         .content(objectMapper.writeValueAsString(request)));
   }
@@ -325,8 +448,15 @@ class PaymentGatewayControllerTest {
   private ResultActions postPayment(Map<String, Object> request, String idempotencyKey)
       throws Exception {
     return mvc.perform(post("/payments")
-      .header("X-API-Key", "test-secret")
+      .header("X-API-Key", merchantApiKey)
         .header("Idempotency-Key", idempotencyKey)
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(objectMapper.writeValueAsString(request)));
+  }
+
+  private ResultActions postVersionedPayment(Map<String, Object> request) throws Exception {
+    return mvc.perform(post("/v1/payments")
+        .header("X-API-Key", merchantApiKey)
         .contentType(MediaType.APPLICATION_JSON)
         .content(objectMapper.writeValueAsString(request)));
   }

@@ -85,6 +85,11 @@ public class InMemoryPaymentStore implements PaymentStore {
     return recovered;
   }
 
+  @Override
+  public int purgeExpiredIdempotencyKeys(Instant now) {
+    return 0;
+  }
+
   private static String key(String merchantId, String idempotencyKey) {
     return merchantId + "\u0000" + idempotencyKey;
   }
