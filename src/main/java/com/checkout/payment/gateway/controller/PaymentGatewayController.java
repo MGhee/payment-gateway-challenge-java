@@ -1,6 +1,7 @@
 package com.checkout.payment.gateway.controller;
 
 import com.checkout.payment.gateway.enums.PaymentStatus;
+import com.checkout.payment.gateway.filter.MerchantAuthenticationInterceptor;
 import com.checkout.payment.gateway.model.ErrorResponse;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PaymentResponse;
@@ -23,6 +24,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
@@ -54,8 +56,9 @@ public class PaymentGatewayController {
       @Parameter(description = "Unique key (e.g. a UUID) that makes retries safe: a retry with "
           + "the same key returns the original payment instead of charging again")
       @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestAttribute(MerchantAuthenticationInterceptor.MERCHANT_ID_ATTRIBUTE) String merchantId,
       @Valid @RequestBody PostPaymentRequest request) {
-    Payment payment = paymentGatewayService.processPayment(request, idempotencyKey);
+        Payment payment = paymentGatewayService.processPayment(request, idempotencyKey, merchantId);
     HttpStatus status =
         payment.status() == PaymentStatus.PENDING ? HttpStatus.ACCEPTED : HttpStatus.CREATED;
     return ResponseEntity.status(status)
@@ -68,7 +71,8 @@ public class PaymentGatewayController {
   @ApiResponse(responseCode = "200", description = "Payment found")
   @ApiResponse(responseCode = "404", description = "Payment not found",
       content = @Content(schema = @Schema(implementation = ErrorResponse.class)))
-  public PaymentResponse getPayment(@PathVariable UUID id) {
-    return PaymentResponse.from(paymentGatewayService.getPayment(id));
+    public PaymentResponse getPayment(@PathVariable UUID id,
+            @RequestAttribute(MerchantAuthenticationInterceptor.MERCHANT_ID_ATTRIBUTE) String merchantId) {
+        return PaymentResponse.from(paymentGatewayService.getPayment(id, merchantId));
   }
 }

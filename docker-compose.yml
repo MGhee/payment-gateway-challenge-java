@@ -1,6 +1,18 @@
-version: "3.8"
-
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payment_gateway
+      POSTGRES_USER: payment_gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_gateway -d payment_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   bank_simulator:
     container_name: bank_simulator
     image: bbyars/mountebank:2.8.1
@@ -20,6 +32,19 @@ services:
       - "8090:8090"
     environment:
       BANK_URL: http://bank_simulator:8080
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment_gateway
+      SPRING_DATASOURCE_USERNAME: payment_gateway
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      MERCHANT_API_KEYS: ${MERCHANT_API_KEYS:?Set MERCHANT_API_KEYS as merchant-id=api-key}
+      BANK_RECONCILIATION_DIRECTORY: /app/settlements
+    volumes:
+      - ${BANK_RECONCILIATION_DIRECTORY:-./settlements}:/app/settlements:ro
     depends_on:
-      - bank_simulator
+      bank_simulator:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
       

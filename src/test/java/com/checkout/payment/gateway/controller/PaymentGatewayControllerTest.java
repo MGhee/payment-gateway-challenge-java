@@ -71,7 +71,7 @@ class PaymentGatewayControllerTest {
         .andReturn();
 
     String id = JsonPath.read(created.getResponse().getContentAsString(), "$.id");
-    mvc.perform(get(created.getResponse().getHeader("Location")))
+    mvc.perform(get(created.getResponse().getHeader("Location")).header("X-API-Key", "test-secret"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.id").value(id))
         .andExpect(jsonPath("$.status").value("Authorized"))
@@ -102,7 +102,7 @@ class PaymentGatewayControllerTest {
         .andExpect(jsonPath("$.status").value("Pending"))
         .andReturn();
 
-    mvc.perform(get(accepted.getResponse().getHeader("Location")))
+    mvc.perform(get(accepted.getResponse().getHeader("Location")).header("X-API-Key", "test-secret"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.status").value("Pending"));
   }
@@ -168,7 +168,10 @@ class PaymentGatewayControllerTest {
 
   @Test
   void everyMissingFieldIsReported() throws Exception {
-    mvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content("{}"))
+    mvc.perform(post("/payments")
+      .header("X-API-Key", "test-secret")
+      .contentType(MediaType.APPLICATION_JSON)
+      .content("{}"))
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.status").value("Rejected"))
         .andExpect(jsonPath("$.errors", containsInAnyOrder(
@@ -196,7 +199,10 @@ class PaymentGatewayControllerTest {
   @ParameterizedTest
   @ValueSource(strings = {"", "not json", "{\"expiry_month\": \"April\"}"})
   void malformedBodyIsRejectedWithoutCallingTheBank(String body) throws Exception {
-    mvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(body))
+    mvc.perform(post("/payments")
+      .header("X-API-Key", "test-secret")
+      .contentType(MediaType.APPLICATION_JSON)
+      .content(body))
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.status").value("Rejected"))
         .andExpect(jsonPath("$.message").value("Malformed request body"));
@@ -211,6 +217,36 @@ class PaymentGatewayControllerTest {
     postPayment(validRequest())
         .andExpect(status().isBadGateway())
         .andExpect(jsonPath("$.message").value("Acquiring bank unavailable, please retry later"));
+  }
+
+  @Test
+  void paymentRoutesRequireMerchantAuthentication() throws Exception {
+    mvc.perform(post("/payments")
+        .contentType(MediaType.APPLICATION_JSON)
+        .content(objectMapper.writeValueAsString(validRequest())))
+        .andExpect(status().isUnauthorized())
+        .andExpect(jsonPath("$.message").value("Authentication required"));
+    verifyNoInteractions(bankClient);
+  }
+
+  @Test
+  void openApiDocumentsMerchantApiKeyAuthentication() throws Exception {
+    mvc.perform(get("/v3/api-docs"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.components.securitySchemes.MerchantApiKey.name")
+            .value("X-API-Key"));
+  }
+
+  @Test
+  void merchantCannotRetrieveAnotherMerchantsPayment() throws Exception {
+    when(bankClient.authorize(any(), any())).thenReturn(new BankPaymentResponse(true, "auth-code"));
+    MvcResult created = postPayment(validRequest())
+        .andExpect(status().isCreated())
+        .andReturn();
+
+    mvc.perform(get("/payments/" + JsonPath.read(created.getResponse().getContentAsString(), "$.id"))
+        .header("X-API-Key", "other-secret"))
+        .andExpect(status().isNotFound());
   }
 
   @Test
@@ -247,20 +283,24 @@ class PaymentGatewayControllerTest {
   @ParameterizedTest
   @ValueSource(strings = {"6f1c2b9e-4d7a-4a5b-9c3e-1f2a3b4c5d6e", "not-a-uuid"})
   void unknownPaymentReturnsNotFound(String id) throws Exception {
-    mvc.perform(get("/payments/" + id))
+    mvc.perform(get("/payments/" + id).header("X-API-Key", "test-secret"))
         .andExpect(status().isNotFound())
         .andExpect(jsonPath("$.message").value("Payment not found"));
   }
 
   @Test
   void requestIdIsEchoedBack() throws Exception {
-    mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-Request-Id", "merchant-req-42"))
+    mvc.perform(get("/payments/" + UUID.randomUUID())
+      .header("X-API-Key", "test-secret")
+      .header("X-Request-Id", "merchant-req-42"))
         .andExpect(header().string("X-Request-Id", "merchant-req-42"));
   }
 
   @Test
   void unsafeRequestIdIsReplaced() throws Exception {
-    mvc.perform(get("/payments/" + UUID.randomUUID()).header("X-Request-Id", "id\nforged log"))
+    mvc.perform(get("/payments/" + UUID.randomUUID())
+      .header("X-API-Key", "test-secret")
+      .header("X-Request-Id", "id\nforged log"))
         .andExpect(header().string("X-Request-Id", matchesPattern("[0-9a-f-]{36}")));
   }
 
@@ -277,6 +317,7 @@ class PaymentGatewayControllerTest {
 
   private ResultActions postPayment(Map<String, Object> request) throws Exception {
     return mvc.perform(post("/payments")
+        .header("X-API-Key", "test-secret")
         .contentType(MediaType.APPLICATION_JSON)
         .content(objectMapper.writeValueAsString(request)));
   }
@@ -284,6 +325,7 @@ class PaymentGatewayControllerTest {
   private ResultActions postPayment(Map<String, Object> request, String idempotencyKey)
       throws Exception {
     return mvc.perform(post("/payments")
+      .header("X-API-Key", "test-secret")
         .header("Idempotency-Key", idempotencyKey)
         .contentType(MediaType.APPLICATION_JSON)
         .content(objectMapper.writeValueAsString(request)));

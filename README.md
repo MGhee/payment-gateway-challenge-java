@@ -4,6 +4,7 @@ A payment gateway API built with Spring Boot. Merchants use it to process card p
 
 - [Running it](#running-it)
 - [API](#api)
+- [Merchant authentication](#merchant-authentication)
 - [How it works](#how-it-works)
 - [Design decisions and assumptions](#design-decisions-and-assumptions)
 - [Observability](#observability)
@@ -14,15 +15,22 @@ A payment gateway API built with Spring Boot. Merchants use it to process card p
 
 **Requirements:** JDK 17 and Docker.
 
+Set local development credentials before starting Compose (PowerShell):
+
+```powershell
+$env:POSTGRES_PASSWORD = "local-only-change-me"
+$env:MERCHANT_API_KEYS = "demo=local-demo-key"
+```
+
+`MERCHANT_API_KEYS` is a comma-separated list of `merchant-id=api-key` pairs. Use strong secrets outside local development.
+
 | What | Command |
 |---|---|
 | Everything in Docker (gateway and bank simulator) | `docker compose up --build` |
-| Gateway locally, simulator in Docker | `docker compose up bank_simulator`, then `./gradlew bootRun` |
+| Gateway locally, database and simulator in Docker | `docker compose up postgres bank_simulator`, then `./gradlew bootRun` |
 | Build and run all tests | `./gradlew build` |
 
-The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger UI) are at **http://localhost:8090/swagger-ui/index.html**.
-
-The simulator decides the outcome from the last digit of the card number:
+The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger UI) are at **http://localhost:8090/swagger-ui/index.html**. The simulator decides the outcome from the last digit of the card number:
 
 | Last digit | Result |
 |---|---|
@@ -31,7 +39,7 @@ The simulator decides the outcome from the last digit of the card number:
 | 0 | Bank error |
 
 ```bash
-curl -i -X POST localhost:8090/payments -H 'Content-Type: application/json' -d '{
+curl -i -X POST localhost:8090/payments -H 'X-API-Key: local-demo-key' -H 'Content-Type: application/json' -d '{
   "card_number": "2222405343248877", "expiry_month": 4, "expiry_year": 2030,
   "currency": "GBP", "amount": 100, "cvv": "123" }'
 ```
@@ -42,6 +50,10 @@ curl -i -X POST localhost:8090/payments -H 'Content-Type: application/json' -d '
 |---|---|---|
 | `POST` | `/payments` | Process a payment |
 | `GET` | `/payments/{id}` | Retrieve a payment |
+
+### Merchant authentication
+
+Every `/payments` request requires an `X-API-Key` header. Keys are configured outside the database using `MERCHANT_API_KEYS` as comma-separated `merchant-id=api-key` pairs. Missing or invalid keys receive `401 Unauthorized`. Payment lookup and idempotency are scoped to the authenticated merchant; a payment owned by another merchant is indistinguishable from a missing payment.
 
 ### Process a payment: `POST /payments`
 
@@ -93,9 +105,9 @@ The `Idempotency-Key` header is optional; a V4 UUID works well. It makes retries
 
 | Situation | Response |
 |---|---|
-| The same key and payment are sent again | The original payment, in its current state. The bank is not called again |
-| The same key is sent while the original request is still running | `409 Conflict`. Retry a little later |
-| The same key is used for a different payment | `422 Unprocessable Entity` |
+| The same merchant sends the same key and payment again | The original payment, in its current state. The bank is not called again |
+| The same merchant sends the key while the original request is still running | `409 Conflict`. Retry a little later |
+| The same merchant uses the key for a different payment | `422 Unprocessable Entity` |
 | The original request failed (`400`, `502`) | The key is not used up, so the retry is processed normally |
 
 ### Retrieve a payment: `GET /payments/{id}`
@@ -109,6 +121,7 @@ Returns the same body as above with **`200 OK`**, or **`404 Not Found`** if no p
 | `201 Created` | The bank **Authorized** or **Declined** the payment, and it was stored | Payment |
 | `202 Accepted` | The bank didn't answer, so the payment is **Pending** and being reversed | Payment |
 | `200 OK` | Payment found | Payment |
+| `401 Unauthorized` | `X-API-Key` is missing or invalid | `{"message":"Authentication required"}` |
 | `400 Bad Request` | The payment was **Rejected** as invalid. The bank was not called and nothing was stored | `{"status":"Rejected","message":"Invalid payment request","errors":["cvv must be 3-4 digits"]}` |
 | `404 Not Found` | No payment with that id | `{"message":"Payment not found"}` |
 | `409 Conflict` | A request with the same `Idempotency-Key` is still being processed | `{"message":"A request with this Idempotency-Key is still being processed"}` |
@@ -116,6 +129,12 @@ Returns the same body as above with **`200 OK`**, or **`404 Not Found`** if no p
 | `502 Bad Gateway` | The bank returned an error or couldn't be reached, so nothing was authorized. No payment was kept and it is safe to retry | `{"message":"Acquiring bank unavailable, please retry later"}` |
 
 Every response carries an `X-Request-Id` header. If the merchant sends one, it is echoed back; otherwise the gateway generates one. The same id appears in every log line for that request.
+
+### Daily settlement reconciliation
+
+At 02:00 UTC, the reconciliation job looks for the previous day's file at `BANK_RECONCILIATION_DIRECTORY/settlement-YYYY-MM-DD.csv`. The expected header is `reference,amount,currency,status`; statuses are `AUTHORIZED`, `DECLINED`, and `PENDING`. The job compares every row with payments created that UTC day, records the report and discrepancies in PostgreSQL, and logs each issue. The CSV adapter is provisional because the simulator does not provide a settlement feed; replace it with the acquiring bank's published format when available.
+
+In Compose, settlement files go in `./settlements` on the host. The directory is mounted read-only into the gateway container. Unprocessed earlier files are retried on each daily run, so a corrected invalid or late report is picked up automatically.
 
 ## How it works
 
@@ -155,11 +174,11 @@ Code layout, under `com.checkout.payment.gateway`:
 | Package | Contents |
 |---|---|
 | `controller` | HTTP endpoints and OpenAPI annotations. No business logic |
-| `service` | The payment flow: idempotency check, store the payment as Pending, call the bank, record the outcome. `PaymentReversalJob` reverses payments whose outcome is unknown |
-| `client` | `BankClient` and the bank's own request/response format. The bank's contract is kept separate from ours. It also decides whether a failure means "nothing authorized" or "outcome unknown" |
+| `service` | Payment flow, stale-authorization recovery, persisted reversal retries, and scheduled settlement reconciliation |
+| `client` | `BankClient` and the bank's own request/response format, protected by a circuit breaker and bulkhead |
 | `validation` | The "expiry date is in the future" rule. It uses an injected `Clock`, so tests can control the date |
 | `exception` | Maps exceptions to the HTTP responses in the status code table |
-| `repository` | In-memory, thread-safe payment store (a `ConcurrentHashMap`) |
+| `repository` | PostgreSQL payment store, transactional reconciliation report store, and database-enforced merchant-scoped idempotency |
 | `filter` | Assigns a request id to every request for log correlation |
 
 ## Design decisions and assumptions
@@ -172,6 +191,13 @@ Code layout, under `com.checkout.payment.gateway`:
 - **Rejected payments get `400` and are never stored.** The spec says no payment is created when information is invalid. The response says `"status": "Rejected"` and lists every validation error at once, using the merchant's own field names, so they can fix everything in one go.
 - **Bank failures get `502 Bad Gateway`.** The gateway itself is healthy; the service behind it failed. The response is distinct from Declined, so a merchant never mistakes "the bank was down" for "the card was refused".
 - **Payment ids are random UUIDs.** They can't be guessed or enumerated. An id that isn't a valid UUID returns `404` rather than `400`, because either way no payment exists at that URL.
+
+### Persistence and merchant isolation
+
+- PostgreSQL stores payments, merchant ownership, idempotency keys, and reversal retry state. Flyway applies versioned schema migrations.
+- The unique `(merchant_id, idempotency_key)` constraint reserves keys atomically, while allowing different merchants to use the same key.
+- Merchant API keys are supplied through environment configuration, not stored in the payment database. Payment reads always include the authenticated merchant id in the query.
+- A stale in-flight authorization is treated as an unknown outcome after the configured bank timeouts plus a grace period. The recovery job turns it into durable reversal work so a process restart cannot strand it.
 
 ### Retries and unknown outcomes
 
@@ -188,7 +214,7 @@ When in doubt, the gateway assumes the bank might have authorized the payment. A
 How this works, as in real gateways:
 
 - **The payment is stored as Pending before the bank is called.** Our payment id goes to the bank as the `reference`, so the payment can be identified later even if no response ever arrives.
-- **Timeout reversal.** `PaymentReversalJob` sends `POST /reversals {"reference": ...}` to the bank, retrying every `bank.reversal-retry-interval`:
+- **Timeout reversal.** `PaymentReversalJob` scans persisted Pending rows and sends `POST /reversals {"reference": ...}` to the bank. Each payment stores its attempt count and next retry time; delays grow exponentially from `bank.reversal-retry-base-delay`:
   - If the reversal succeeds, the payment becomes **Declined** and no money is held.
   - After `bank.reversal-max-attempts` failures, it stays **Pending**. An ERROR log and the `payments_reversals_total{outcome="failed"}` metric flag it for **manual reconciliation** against the bank's settlement report.
 - **Idempotency keys** let the merchant retry safely. A retry after a timeout returns the Pending payment, and later its final status, instead of charging again.
@@ -203,6 +229,7 @@ How this works, as in real gateways:
   - Validation errors never repeat the rejected value back to the merchant.
 - **Fractional amounts are rejected.** By default, Jackson would silently turn `10.5` into `10`, so this is switched off (`accept-float-as-int=false`).
 - **A client-supplied `X-Request-Id` is accepted only if it is safe.** It must match `[A-Za-z0-9-]{1,64}`, because it is written into the logs and could otherwise be used to forge log lines.
+- **Merchant API keys are compared in constant time** and never included in logs or responses.
 
 ### Assumptions
 
@@ -218,9 +245,9 @@ How this works, as in real gateways:
   - reversals at `POST /reversals {"reference": ...}`.
   
   Against the simulator, reversals fail and end in manual reconciliation. A timeout never happens with the simulator unless it is forced, for example with `BANK_READ_TIMEOUT=1ms`.
-- **Idempotency keys are global and never expire.** In production they would be scoped to each merchant and expire after a while (Checkout.com uses 72 hours).
-- **Storage is in memory, as the spec allows.** Payments are lost on restart and aren't shared between instances.
-- **Merchant authentication is out of scope.**
+- **Idempotency keys are merchant-scoped and do not expire.** Production retention and key rotation policies should be agreed with merchants.
+- **PostgreSQL is the chosen transactional store for this implementation.** Checkout.com's internal database technology is not publicly documented, so this is a project design choice rather than a claim about its production stack.
+- **Settlement files use an assumed adapter contract.** The bank simulator has no settlement feed. Until the acquiring bank's actual format is known, the adapter expects one CSV per UTC day named `settlement-YYYY-MM-DD.csv`, with `reference,amount,currency,status` columns and `AUTHORIZED`, `DECLINED`, or `PENDING` status values.
 
 ## Observability
 
@@ -234,6 +261,7 @@ How this works, as in real gateways:
 Metrics:
 - `payments_processed_total{status="Authorized", "Declined" or "Pending"}` counts outcomes, to track the authorization rate. A rise in `Pending` means the bank is timing out.
 - `payments_reversals_total{outcome="reversed" or "failed"}` counts reversals. **Alert on `failed`**: each one is a payment that needs manual reconciliation.
+- `payments_reconciliation_reports_total{outcome="completed", "duplicate", "missing" or "invalid"}` tracks daily report handling; `payments_reconciliation_issues_total` counts discrepancies.
 - `http_server_requests_seconds` gives our own latency and error rate, broken down by status code. Rejections show up here as `400`s.
 - `http_client_requests_seconds` gives the bank's latency and its error responses.
 
@@ -244,17 +272,19 @@ Log levels:
 
 ## Testing
 
-`./gradlew build` runs 73 tests in five classes.
+`./gradlew build` runs the complete unit and Spring MVC test suite.
 
 | Test class | Type | What it covers |
 |---|---|---|
 | `PaymentGatewayControllerTest` | Full Spring context with MockMvc. Only `BankClient` is mocked | The API contract: status codes, JSON field names, the `Location` header, a POST followed by a GET, every validation rule and its boundaries, malformed JSON, fractional amounts, `502` on bank failure, `202` Pending on unknown outcomes, idempotent replay and `422` on key reuse, and the request id. It also checks that card data never appears in a response |
 | `BankClientTest` | `MockRestServiceServer` | The exact JSON sent to the bank (reference, snake_case, zero-padded `MM/YYYY` expiry), the reversal call, and sorting each failure into the right group: error statuses and "connection refused" mean nothing was authorized; timeouts and unreadable bodies mean the outcome is unknown |
-| `PaymentGatewayServiceTest` | Plain unit test | Pending is stored before the bank call, status mapping, only the last four digits are stored, unknown outcomes schedule a reversal, and the idempotency rules: replay, replay of a Pending payment, `409` for a duplicate in progress, `422` on reuse, and the key being released after a `502` |
-| `PaymentReversalJobTest` | Plain unit test | A reversal moves the payment to Declined and is never sent twice; failures are retried; after the maximum attempts the payment stays Pending and the `failed` metric goes up |
+| `PaymentGatewayServiceTest` | Plain unit test | Pending is stored before the bank call, merchant-scoped idempotency, status mapping, card data minimization, and failure behavior |
+| `PaymentReversalJobTest` | Plain unit test | Persisted reversal work, retry behavior, terminal manual-reconciliation state, and metrics |
+| `PaymentAuthorizationRecoveryJobTest` | Plain unit test | Stale in-flight authorizations become durable reversal work after a restart |
+| `SettlementReconciliationServiceTest` | Plain unit test | Matched rows, amount/currency/status mismatches, unknown/duplicate/missing references, Pending payments, and invalid headers |
 | `FutureExpiryDateValidatorTest` | Plain unit test with a fixed `Clock` | Expiry boundaries: the current month is valid and the previous month is not |
 
-The whole system was also checked by hand with `docker compose up` against the real simulator:
+The whole system was also checked by hand with `docker compose up --build` against the simulator:
 - A card ending in an odd digit came back Authorized.
 - An even digit came back Declined.
 - A card ending in 0 gave a `502`.
@@ -279,13 +309,10 @@ The whole system was also checked by hand with `docker compose up` against the r
 
 ## What I'd do next
 
-These would come before production, roughly in priority order:
+The foundational persistence, merchant isolation, CSV reconciliation adapter, and bank-call resilience are implemented. Before production, the next priorities would be:
 
-1. **A real database** in place of the in-memory store, plus merchant authentication, so merchants can only see their own payments.
-   - Idempotency keys would become a unique `(merchant_id, key)` constraint and expire after a set period.
-   - The reversal queue would become the Pending rows themselves, so a restart can't lose a reversal.
+1. **Integrate the acquiring bank's official settlement feed**, replacing the provisional CSV contract and agreeing how the bank represents captures, reversals, fees, and settlement dates.
 2. **Webhooks**, so merchants learn when a Pending payment becomes final without polling.
-3. **Daily reconciliation** against the bank's settlement files, to catch anything that is still Pending or doesn't match.
-4. **Resilience.** Add a circuit breaker and bulkhead around the bank call, and back off exponentially between reversal attempts.
-5. **Better telemetry.** Add OpenTelemetry tracing that passes trace context on to the bank, write logs as JSON, and serve actuator endpoints on a separate management port.
-6. **API versioning**, such as `/v1/payments`. Possibly also standard error bodies following RFC 7807 (Problem Details), and reason codes on declines.
+3. **Merchant credential lifecycle**, including secure provisioning, hashing/rotation, revocation, and idempotency-key retention policy.
+4. **Better telemetry**, including OpenTelemetry trace propagation, structured logs, and a separate actuator port.
+5. **API versioning**, such as `/v1/payments`, and standard error bodies following RFC 7807 (Problem Details).

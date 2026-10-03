@@ -1,6 +1,12 @@
 package com.checkout.payment.gateway.configuration;
 
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import java.time.Clock;
+import java.time.Duration;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -23,5 +29,32 @@ public class ApplicationConfiguration {
         .setConnectTimeout(bank.connectTimeout())
         .setReadTimeout(bank.readTimeout())
         .build();
+  }
+
+  @Bean
+  public CircuitBreaker bankCircuitBreaker(
+      @Value("${bank.circuit-breaker.sliding-window-size:10}") int slidingWindowSize,
+      @Value("${bank.circuit-breaker.minimum-number-of-calls:5}") int minimumNumberOfCalls,
+      @Value("${bank.circuit-breaker.failure-rate-threshold:50}") float failureRateThreshold,
+      @Value("${bank.circuit-breaker.wait-duration-in-open-state:30s}") Duration waitDuration,
+      @Value("${bank.circuit-breaker.permitted-calls-in-half-open-state:3}") int halfOpenCalls) {
+    CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+        .slidingWindowSize(slidingWindowSize)
+        .minimumNumberOfCalls(minimumNumberOfCalls)
+        .failureRateThreshold(failureRateThreshold)
+        .waitDurationInOpenState(waitDuration)
+        .permittedNumberOfCallsInHalfOpenState(halfOpenCalls)
+        .build();
+    return CircuitBreaker.of("bank", config);
+  }
+
+  @Bean
+  public Bulkhead bankBulkhead(
+      @Value("${bank.bulkhead.max-concurrent-calls:20}") int maxConcurrentCalls) {
+    BulkheadConfig config = BulkheadConfig.custom()
+        .maxConcurrentCalls(maxConcurrentCalls)
+        .maxWaitDuration(Duration.ZERO)
+        .build();
+    return Bulkhead.of("bank", config);
   }
 }

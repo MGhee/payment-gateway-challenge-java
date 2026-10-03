@@ -8,6 +8,7 @@ public record BankProperties(
     String url,
     Duration connectTimeout,
     Duration readTimeout,
-    int reversalMaxAttempts) {
+    int reversalMaxAttempts,
+    Duration reversalRetryBaseDelay) {
 
 }

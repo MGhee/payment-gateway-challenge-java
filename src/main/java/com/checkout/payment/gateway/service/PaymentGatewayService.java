@@ -9,7 +9,7 @@ import com.checkout.payment.gateway.exception.IdempotencyKeyReusedException;
 import com.checkout.payment.gateway.exception.PaymentNotFoundException;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
-import com.checkout.payment.gateway.repository.PaymentsRepository;
+import com.checkout.payment.gateway.repository.PaymentStore;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.Optional;
 import java.util.Set;
@@ -25,22 +25,21 @@ public class PaymentGatewayService {
   private static final Logger LOG = LoggerFactory.getLogger(PaymentGatewayService.class);
 
   private final Set<UUID> inFlight = ConcurrentHashMap.newKeySet();
-  private final PaymentsRepository paymentsRepository;
+  private final PaymentStore paymentsRepository;
   private final BankClient bankClient;
-  private final PaymentReversalJob reversalJob;
   private final MeterRegistry meterRegistry;
 
-  public PaymentGatewayService(PaymentsRepository paymentsRepository, BankClient bankClient,
-      PaymentReversalJob reversalJob, MeterRegistry meterRegistry) {
+  public PaymentGatewayService(PaymentStore paymentsRepository, BankClient bankClient,
+      MeterRegistry meterRegistry) {
     this.paymentsRepository = paymentsRepository;
     this.bankClient = bankClient;
-    this.reversalJob = reversalJob;
     this.meterRegistry = meterRegistry;
   }
 
-  public Payment processPayment(PostPaymentRequest request, String idempotencyKey) {
+  public Payment processPayment(PostPaymentRequest request, String idempotencyKey,
+      String merchantId) {
     // Stored before calling the bank, so a payment the bank may have authorized is never lost
-    Payment pending = Payment.pending(request, idempotencyKey);
+    Payment pending = Payment.pending(request, idempotencyKey, merchantId);
     inFlight.add(pending.id());
     try {
       Optional<Payment> original = paymentsRepository.addIfKeyUnused(pending);
@@ -57,7 +56,7 @@ public class PaymentGatewayService {
     if (!original.matches(request)) {
       throw new IdempotencyKeyReusedException(original.id());
     }
-    if (inFlight.contains(original.id())) {
+    if (original.authorizationInProgress() || inFlight.contains(original.id())) {
       throw new IdempotencyConflictException(original.id());
     }
     LOG.info("Payment {} returned for a retried request", original.id());
@@ -75,8 +74,8 @@ public class PaymentGatewayService {
       throw e;
     } catch (BankOutcomeUnknownException e) {
       LOG.warn("Bank outcome unknown for payment {}, scheduling reversal", pending.id(), e);
-      reversalJob.schedule(pending.id());
-      payment = pending;
+      payment = pending.withUnknownOutcome(java.time.Instant.now());
+      paymentsRepository.save(payment);
     }
 
     meterRegistry.counter("payments.processed", "status", payment.status().getName()).increment();
@@ -85,7 +84,8 @@ public class PaymentGatewayService {
     return payment;
   }
 
-  public Payment getPayment(UUID id) {
-    return paymentsRepository.get(id).orElseThrow(() -> new PaymentNotFoundException(id));
+  public Payment getPayment(UUID id, String merchantId) {
+    return paymentsRepository.get(id, merchantId)
+        .orElseThrow(() -> new PaymentNotFoundException(id));
   }
 }

@@ -11,8 +11,13 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 import com.checkout.payment.gateway.exception.AcquiringBankException;
 import com.checkout.payment.gateway.exception.BankOutcomeUnknownException;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import java.net.ConnectException;
 import java.net.SocketTimeoutException;
+import java.time.Duration;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -30,7 +35,8 @@ class BankClientTest {
 
   private final RestTemplate restTemplate = new RestTemplateBuilder().rootUri("http://bank").build();
   private final MockRestServiceServer bank = MockRestServiceServer.bindTo(restTemplate).build();
-  private final BankClient bankClient = new BankClient(restTemplate);
+  private final BankClient bankClient = new BankClient(restTemplate,
+      CircuitBreaker.ofDefaults("bank-test"), Bulkhead.ofDefaults("bank-test"));
 
   private final PostPaymentRequest request =
       new PostPaymentRequest("2222405343248877", 4, 2030, "GBP", 100, "123");
@@ -129,4 +135,47 @@ class BankClientTest {
     assertThatThrownBy(() -> bankClient.reverse(REFERENCE))
         .isInstanceOf(AcquiringBankException.class);
   }
+
+      @Test
+      void openCircuitRejectsAuthorizationWithoutCallingTheBank() {
+      CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+        .slidingWindowSize(2)
+        .minimumNumberOfCalls(2)
+        .failureRateThreshold(50)
+        .waitDurationInOpenState(Duration.ofMinutes(1))
+        .build();
+      BankClient guardedClient = new BankClient(restTemplate,
+        CircuitBreaker.of("open-bank", config), Bulkhead.ofDefaults("open-bank"));
+      bank.expect(requestTo("http://bank/payments"))
+        .andRespond(withStatus(HttpStatusCode.valueOf(503)));
+      bank.expect(requestTo("http://bank/payments"))
+        .andRespond(withStatus(HttpStatusCode.valueOf(503)));
+
+      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+        .isInstanceOf(AcquiringBankException.class);
+      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+        .isInstanceOf(AcquiringBankException.class);
+      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+        .isInstanceOf(AcquiringBankException.class);
+
+      bank.verify();
+      }
+
+      @Test
+      void fullBulkheadRejectsAuthorizationWithoutCallingTheBank() {
+      BulkheadConfig config = BulkheadConfig.custom()
+        .maxConcurrentCalls(1)
+        .maxWaitDuration(Duration.ZERO)
+        .build();
+      Bulkhead bulkhead = Bulkhead.of("full-bank", config);
+      assertThat(bulkhead.tryAcquirePermission()).isTrue();
+      BankClient guardedClient = new BankClient(restTemplate,
+        CircuitBreaker.ofDefaults("full-bank"), bulkhead);
+
+      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+        .isInstanceOf(AcquiringBankException.class);
+
+      bulkhead.releasePermission();
+      bank.verify();
+      }
 }

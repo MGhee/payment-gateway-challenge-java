@@ -13,29 +13,34 @@ import com.checkout.payment.gateway.enums.PaymentStatus;
 import com.checkout.payment.gateway.exception.AcquiringBankException;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
-import com.checkout.payment.gateway.repository.PaymentsRepository;
+import com.checkout.payment.gateway.repository.InMemoryPaymentStore;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class PaymentReversalJobTest {
 
   private static final int MAX_ATTEMPTS = 3;
+  private static final Instant NOW = Instant.parse("2026-10-03T12:00:00Z");
 
   private final BankClient bankClient = mock(BankClient.class);
-  private final PaymentsRepository repository = new PaymentsRepository();
+  private final InMemoryPaymentStore repository = new InMemoryPaymentStore();
   private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
   private final PaymentReversalJob job = new PaymentReversalJob(bankClient, repository,
-      meterRegistry, new BankProperties("http://bank", Duration.ZERO, Duration.ZERO, MAX_ATTEMPTS));
+        meterRegistry, new BankProperties("http://bank", Duration.ZERO, Duration.ZERO, MAX_ATTEMPTS,
+            Duration.ZERO), Clock.fixed(NOW, ZoneOffset.UTC));
 
   private final Payment pending = Payment.pending(
-      new PostPaymentRequest("2222405343248877", 4, 2030, "GBP", 100, "123"), null);
+      new PostPaymentRequest("2222405343248877", 4, 2030, "GBP", 100, "123"), null,
+      "test-merchant");
 
   @BeforeEach
   void scheduleReversalOfPendingPayment() {
-    repository.save(pending);
-    job.schedule(pending.id());
+    repository.save(pending.withUnknownOutcome(NOW));
   }
 
   @Test
@@ -63,6 +68,25 @@ class PaymentReversalJobTest {
   }
 
   @Test
+  void exponentialRetryScheduleSurvivesJobRecreation() {
+    doThrow(new AcquiringBankException("Service Unavailable"),
+        new AcquiringBankException("Service Unavailable")).when(bankClient).reverse(pending.id());
+    PaymentReversalJob firstRun = job(Duration.ofSeconds(5), NOW);
+
+    firstRun.reversePendingPayments();
+    assertThat(repository.get(pending.id()).orElseThrow().nextReversalAt())
+        .isEqualTo(NOW.plusSeconds(5));
+
+    PaymentReversalJob restartedJob = job(Duration.ofSeconds(5), NOW.plusSeconds(5));
+    restartedJob.reversePendingPayments();
+
+    Payment retried = repository.get(pending.id()).orElseThrow();
+    assertThat(retried.reversalAttempts()).isEqualTo(2);
+    assertThat(retried.nextReversalAt()).isEqualTo(NOW.plusSeconds(15));
+    verify(bankClient, times(2)).reverse(pending.id());
+  }
+
+  @Test
   void paymentIsLeftPendingForManualReconciliationAfterMaxAttempts() {
     doThrow(new AcquiringBankException("Service Unavailable"))
         .when(bankClient).reverse(pending.id());
@@ -78,6 +102,12 @@ class PaymentReversalJobTest {
 
   private PaymentStatus status() {
     return repository.get(pending.id()).orElseThrow().status();
+  }
+
+  private PaymentReversalJob job(Duration retryBaseDelay, Instant now) {
+    return new PaymentReversalJob(bankClient, repository, meterRegistry,
+        new BankProperties("http://bank", Duration.ZERO, Duration.ZERO, MAX_ATTEMPTS,
+            retryBaseDelay), Clock.fixed(now, ZoneOffset.UTC));
   }
 
   private double reversals(String outcome) {
