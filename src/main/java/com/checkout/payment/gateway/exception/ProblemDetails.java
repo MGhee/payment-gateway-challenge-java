@@ -23,6 +23,10 @@ public final class ProblemDetails {
       return ResponseEntity.status(status).body(legacyBody);
     }
     ProblemDetail problem = create(status, type, detail, request);
+    // RFC 7807 reserves "status" for the HTTP code
+    if (legacyBody.status() != null) {
+      problem.setProperty("payment_status", legacyBody.status());
+    }
     if (errors != null) {
       problem.setProperty("errors", errors);
     }

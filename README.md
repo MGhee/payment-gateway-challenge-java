@@ -2,6 +2,7 @@
 
 A payment gateway API built with Spring Boot. Merchants use it to process card payments through an acquiring bank and to look up those payments afterwards.
 
+- [Scope](#scope)
 - [Running it](#running-it)
 - [API](#api)
 - [Merchant authentication](#merchant-authentication)
@@ -12,23 +13,45 @@ A payment gateway API built with Spring Boot. Merchants use it to process card p
 - [Testing](#testing)
 - [What I'd do next](#what-id-do-next)
 
+## Scope
+
+The brief is met by a small core. To review only that, read these files:
+
+| Brief | Where |
+|---|---|
+| Process a payment: Authorized, Declined or Rejected | `PaymentGatewayController`, `PaymentGatewayService` |
+| Validation rules | `PostPaymentRequest`, `FutureExpiryDateValidator` |
+| Call the bank simulator | `BankClient`, `BankPaymentRequest`, `BankPaymentResponse` |
+| Response fields, with only the last four card digits | `PaymentResponse` |
+| Rejected without calling the bank | `CommonExceptionHandler` |
+| Retrieve a payment | `PaymentGatewayController.getPayment` |
+| Tests | `PaymentGatewayControllerTest`, `FutureExpiryDateValidatorTest`, `BankClientTest`, `BankSimulatorIntegrationTest` |
+
+Everything else is production hardening that the brief doesn't ask for. I added each piece to close a specific failure mode of a real gateway:
+
+| Addition | Why |
+|---|---|
+| PostgreSQL and Flyway, instead of the in-memory store | Payments survive restarts and can be shared by several instances |
+| Merchant API keys | Without them, any caller can read any merchant's payments |
+| `Idempotency-Key` | A merchant retrying after a timeout must not charge the shopper twice |
+| `Pending` status, reversal and recovery jobs | When the bank's answer is lost, the payment may be authorized; it gets reversed rather than left holding funds |
+| Circuit breaker, bank bulkhead and per-merchant limit | A slow bank or one busy merchant can't exhaust the gateway for everyone |
+| Settlement reconciliation | Catches differences between our records and the bank's |
+| `/v1` routes and Problem Details errors | A versioned contract with a standard error format; `/payments` keeps the original shape |
+| Tracing, JSON logs, metrics and a separate actuator port | One payment can be followed across the gateway and the bank |
+| Integration tests, a k6 load test and CI | Covers what unit tests can't: the real database, real HTTP failures and behavior under load |
+
+Each is explained under [Design decisions and assumptions](#design-decisions-and-assumptions) and [Observability](#observability).
+
 ## Running it
 
 **Requirements:** JDK 17 and Docker.
 
-Set local development credentials before starting Compose (PowerShell):
-
-```powershell
-$env:POSTGRES_PASSWORD = "local-only-change-me"
-$env:GATEWAY_ADMIN_API_KEY = "local-only-admin-key"
-```
-
-The admin key provisions merchant keys and is not used for payment requests. Use a strong secret outside local development.
+Compose reads local-only credentials from [.env](.env), so `docker compose up --build` works as is. Variables set in your shell override that file; use strong secrets outside local development. The admin key provisions merchant keys and is not used for payment requests.
 
 | What | Command |
 |---|---|
 | Everything in Docker (gateway, bank simulator, PostgreSQL and Jaeger) | `docker compose up --build` |
-| Gateway locally, database and simulator in Docker | `docker compose up postgres bank_simulator`, then `./gradlew bootRun` |
 | Build and run all tests (unit, integration, coverage gate) | `./gradlew build` |
 | Integration tests only | `./gradlew integrationTest` |
 | Load test against the full stack | `docker compose --profile perf run --rm k6` |
@@ -42,7 +65,7 @@ The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger 
 | 0 | Bank error |
 
 ```powershell
-$adminHeaders = @{ "X-Gateway-Admin-Key" = $env:GATEWAY_ADMIN_API_KEY }
+$adminHeaders = @{ "X-Gateway-Admin-Key" = "local-only-admin-key" }
 $merchant = Invoke-RestMethod -Method Post `
   -Uri http://localhost:8090/admin/merchants/demo/api-keys -Headers $adminHeaders
 
@@ -140,7 +163,7 @@ Returns the same body as above with **`200 OK`**, or **`404 Not Found`** if no p
 | `202 Accepted` | The bank didn't answer, so the payment is **Pending** and being reversed | Payment |
 | `200 OK` | Payment found | Payment |
 | `401 Unauthorized` | `X-API-Key` is missing, invalid, revoked, or expired | Problem Details on `/v1`; legacy error JSON on `/payments` |
-| `400 Bad Request` | The payment was **Rejected** as invalid. The bank was not called and nothing was stored | Problem Details on `/v1`, including an `errors` extension; legacy error JSON on `/payments` |
+| `400 Bad Request` | The payment was **Rejected** as invalid. The bank was not called and nothing was stored | Problem Details on `/v1`, with `"payment_status": "Rejected"` and an `errors` extension; legacy error JSON with `"status": "Rejected"` on `/payments` |
 | `404 Not Found` | No payment with that id | Problem Details on `/v1`; legacy error JSON on `/payments` |
 | `409 Conflict` | A request with the same `Idempotency-Key` is still being processed | Problem Details on `/v1`; legacy error JSON on `/payments` |
 | `422 Unprocessable Entity` | The `Idempotency-Key` was already used for a different payment during its retention period | Problem Details on `/v1`; legacy error JSON on `/payments` |
@@ -207,7 +230,7 @@ Code layout, under `com.checkout.payment.gateway`:
 - **Versioned resource, `/v1/payments`.** `POST` creates a payment and `GET /v1/payments/{id}` reads it. The unversioned `/payments` routes remain compatibility aliases.
 - **Field names are snake_case**, the same style as the bank simulator and Checkout.com's public API.
 - **`201 Created` for both Authorized and Declined.** A declined payment is still a payment that was created. Its outcome is in `status`, not in the HTTP code.
-- **Rejected payments get `400` and are never stored.** The spec says no payment is created when information is invalid. The response says `"status": "Rejected"` and lists every validation error at once, using the merchant's own field names, so they can fix everything in one go.
+- **Rejected payments get `400` and are never stored.** The spec says no payment is created when information is invalid. The response says `"payment_status": "Rejected"` (`"status"` on the legacy routes, since Problem Details reserves `status` for the HTTP code) and lists every validation error at once, using the merchant's own field names, so they can fix everything in one go.
 - **Bank failures get `502 Bad Gateway`.** The gateway itself is healthy; the service behind it failed. The response is distinct from Declined, so a merchant never mistakes "the bank was down" for "the card was refused".
 - **Payment ids are random UUIDs.** They can't be guessed or enumerated. An id that isn't a valid UUID returns `404` rather than `400`, because either way no payment exists at that URL.
 
@@ -261,7 +284,7 @@ If a lease expires while its holder is still running (a stall longer than the wh
   - Only the last four digits are kept, as a string, so a leading zero survives (`"0123"`).
   - The request objects override `toString()` to mask card data, because RestTemplate prints request bodies when debug logging is on.
   - Validation errors never repeat the rejected value back to the merchant.
-- **Fractional amounts are rejected.** By default, Jackson would silently turn `10.5` into `10`, so this is switched off (`accept-float-as-int=false`).
+- **Non-integer amounts are rejected.** By default, Jackson would silently turn `10.5` into `10` and `"1050"` into `1050`, so both are switched off (`accept-float-as-int=false`, `allow-coercion-of-scalars=false`).
 - **A client-supplied `X-Request-Id` is accepted only if it is safe.** It must match `[A-Za-z0-9-]{1,64}`, because it is written into the logs and could otherwise be used to forge log lines.
 - **The bootstrap admin key is compared in constant time.** Generated merchant keys have 256 bits of entropy; only their hashes and prefixes are stored, and raw values are never logged.
 
@@ -292,7 +315,7 @@ If a lease expires while its holder is still running (a stall longer than the wh
 | Build and version info | `:8091/actuator/info` |
 | Metrics, in Prometheus format | `:8091/actuator/prometheus` (see below) |
 | Traces | OpenTelemetry, exported over OTLP. In Compose, open Jaeger at http://localhost:16686 and pick the `payment-gateway` service |
-| Logs | JSON in Compose, plain text under `bootRun`. Every line carries the request id, trace id and span id |
+| Logs | JSON in Compose, plain text without the `json-logs` profile. Every line carries the request id, trace id and span id |
 
 ### Separate actuator port
 
@@ -302,7 +325,7 @@ Actuator runs on management port `8091` (`MANAGEMENT_SERVER_PORT`), separate fro
 
 - **W3C trace context is propagated end to end.** If the merchant sends a `traceparent` header, the gateway joins that trace; otherwise it starts a new one. Every call to the bank carries a `traceparent` header, so the bank's own spans can join the same trace.
 - **Background work is traced too.** Each run of a `@Scheduled` job (reversals, stale-authorization recovery, reconciliation) gets its own trace, so a reversal's bank call can be found as well.
-- **Export is opt-in.** Spans go over OTLP/HTTP only when `MANAGEMENT_OTLP_TRACING_ENDPOINT` is set. Compose points it at the bundled Jaeger. To export from `bootRun`, run `docker compose up postgres bank_simulator jaeger` and set `MANAGEMENT_OTLP_TRACING_ENDPOINT=http://localhost:4318/v1/traces`.
+- **Export is opt-in.** Spans go over OTLP/HTTP only when `MANAGEMENT_OTLP_TRACING_ENDPOINT` is set. Compose points it at the bundled Jaeger.
 - **Sampling** is 100% by default. At production volumes, lower it with `MANAGEMENT_TRACING_SAMPLING_PROBABILITY`. The gateway honors the sampling decision in an incoming `traceparent`, so a public edge should strip or re-root merchant trace headers.
 
 Card data never appears in spans. Request and response bodies aren't recorded, and card details are never part of a URL.

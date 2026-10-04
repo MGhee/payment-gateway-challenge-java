@@ -208,16 +208,21 @@ class PaymentGatewayControllerTest {
     verifyNoInteractions(bankClient);
   }
 
-  @Test
-  void fractionalAmountIsRejectedRatherThanTruncated() throws Exception {
+  @ParameterizedTest
+  @MethodSource("nonIntegerAmounts")
+  void nonIntegerAmountIsRejectedRatherThanCoerced(Object amount) throws Exception {
     Map<String, Object> request = validRequest();
-    request.put("amount", 10.5);
+    request.put("amount", amount);
 
     postPayment(request)
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.status").value("Rejected"))
         .andExpect(jsonPath("$.message").value("Malformed request body"));
     verifyNoInteractions(bankClient);
+  }
+
+  static Stream<Object> nonIntegerAmounts() {
+    return Stream.of(10.5, "1050");
   }
 
   @ParameterizedTest
@@ -307,6 +312,7 @@ class PaymentGatewayControllerTest {
       .andExpect(jsonPath("$.type").value("urn:payment-gateway:problem:invalid-payment-request"))
       .andExpect(jsonPath("$.title").value("Bad Request"))
       .andExpect(jsonPath("$.status").value(400))
+      .andExpect(jsonPath("$.payment_status").value("Rejected"))
       .andExpect(jsonPath("$.detail").value("Invalid payment request"))
       .andExpect(jsonPath("$.errors[0]").value("amount must be greater than 0"));
     }
