@@ -4,12 +4,15 @@ import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import java.net.URI;
+import java.net.http.HttpClient;
 import java.time.Clock;
 import java.time.Duration;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.web.client.RestTemplate;
 
@@ -24,10 +27,19 @@ public class ApplicationConfiguration {
 
   @Bean
   public RestTemplate bankRestTemplate(RestTemplateBuilder builder, BankProperties bank) {
+    if (URI.create(bank.url()).getHost() == null) {
+      throw new IllegalStateException("bank.url has no valid hostname: " + bank.url());
+    }
+    // Pinned because OkHttp and HttpURLConnection silently resend a POST after a connection reset
+    HttpClient httpClient = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
+        .connectTimeout(bank.connectTimeout())
+        .build();
+    JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
+    requestFactory.setReadTimeout(bank.readTimeout());
     return builder
         .rootUri(bank.url())
-        .setConnectTimeout(bank.connectTimeout())
-        .setReadTimeout(bank.readTimeout())
+        .requestFactory(() -> requestFactory)
         .build();
   }
 

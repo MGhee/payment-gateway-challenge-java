@@ -29,7 +29,9 @@ The admin key provisions merchant keys and is not used for payment requests. Use
 |---|---|
 | Everything in Docker (gateway, bank simulator, PostgreSQL and Jaeger) | `docker compose up --build` |
 | Gateway locally, database and simulator in Docker | `docker compose up postgres bank_simulator`, then `./gradlew bootRun` |
-| Build and run all tests | `./gradlew build` |
+| Build and run all tests (unit, integration, coverage gate) | `./gradlew build` |
+| Integration tests only | `./gradlew integrationTest` |
+| Load test against the full stack | `docker compose --profile perf run --rm k6` |
 
 The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger UI) are at **http://localhost:8090/swagger-ui/index.html**. Actuator endpoints are on a separate management port, **http://localhost:8091/actuator**, and traces are in Jaeger at **http://localhost:16686** (see [Observability](#observability)). The simulator decides the outcome from the last digit of the card number:
 
@@ -236,6 +238,7 @@ How this works, as in real gateways:
 - **Idempotency keys** let the merchant retry safely. A retry after a timeout returns the Pending payment, and later its final status, instead of charging again.
   - The key is reserved atomically together with the Pending payment, so two simultaneous duplicates can't both reach the bank.
   - Since the card number and CVV are never stored, a retry is recognised as "the same payment" by its last four digits, expiry, currency and amount.
+- **The gateway itself never resends a payment to the bank.** Bank calls use the JDK `HttpClient`, which does not retry POSTs. OkHttp and `HttpURLConnection` both silently resend a POST after a connection reset, which could authorize the same payment twice. `BankFailureIntegrationTest` resets the connection and checks that the bank sees exactly one request.
 
 ### Card data and security
 
@@ -315,7 +318,13 @@ Log levels:
 
 ## Testing
 
-`./gradlew build` runs the complete unit and Spring MVC test suite.
+`./gradlew build` runs three layers and fails if any of them fails. Docker is required, because integration tests use Testcontainers.
+
+1. **Unit and Spring MVC tests** (`src/test`) run in-process against H2 and mocks.
+2. **Integration tests** (`src/integrationTest`) start the real application on a random port. It uses a PostgreSQL 16 container plus either the Mountebank simulator or a fault-injecting WireMock bank.
+3. **A coverage gate.** JaCoCo merges both suites and requires at least 90% line and 80% branch coverage. Coverage is currently about 95% of lines and 83% of branches. The HTML report is at `build/reports/jacoco/test/html/index.html`.
+
+### Unit and Spring MVC tests
 
 | Test class | Type | What it covers |
 |---|---|---|
@@ -325,8 +334,49 @@ Log levels:
 | `PaymentReversalJobTest` | Plain unit test | Persisted reversal work, retry behavior, terminal manual-reconciliation state, and metrics |
 | `PaymentAuthorizationRecoveryJobTest` | Plain unit test | Stale in-flight authorizations become durable reversal work after a restart |
 | `SettlementReconciliationServiceTest` | Plain unit test | Matched rows, amount/currency/status mismatches, unknown/duplicate/missing references, Pending payments, and invalid headers |
+| `SettlementReconciliationJobTest` | Plain unit test with a fixed `Clock` | Which daily files are picked up (yesterday's and late earlier ones, not processed or future ones), and missing or invalid reports |
 | `FutureExpiryDateValidatorTest` | Plain unit test with a fixed `Clock` | Expiry boundaries: the current month is valid and the previous month is not |
+| `ApplicationConfigurationTest` | Plain unit test | A bank URL with an invalid hostname (for example, containing `_`) fails at startup instead of on the first payment |
 | `TelemetryTest` | Full Spring context with tracing enabled; the bank is a `MockRestServiceServer` | An incoming `traceparent` reaches the bank request and the log context, and the `json-logs` profile writes one JSON object per line with MDC fields |
+
+### Integration tests
+
+One PostgreSQL container is shared by every class for the whole run. Each test provisions its own merchant, so tests don't depend on each other's data.
+
+| Test class | Bank | What it covers |
+|---|---|---|
+| `BankSimulatorIntegrationTest` | The Mountebank imposter used by Compose | The request contract against the real simulator: Authorized and Declined are returned, persisted and retrievable. A simulator error returns `502`, stores nothing and frees the idempotency key, which proves the `ON DELETE CASCADE` on PostgreSQL |
+| `BankFailureIntegrationTest` | WireMock over real sockets | A real read timeout returns `202` Pending, then the reversal job calls `/reversals` and the payment becomes Declined. A connection reset is an unknown outcome and **the bank receives exactly one POST**. Eight concurrent requests with the same `Idempotency-Key` reach the bank once and store one payment |
+| `PostgresPersistenceIntegrationTest` | None | Flyway migrations on PostgreSQL, an exact round trip of every payment column (UUID, `timestamptz` at microsecond precision), unique-key translation for duplicate idempotency keys and settlement reports, key expiry and reuse, stale-authorization recovery, and settlement issues stored once per day |
+
+Tests pin their own configuration inline, so environment variables exported for Compose, such as `GATEWAY_ADMIN_API_KEY`, can't change their behavior.
+
+### Load test
+
+[`perf/payments.js`](perf/payments.js) is a [k6](https://k6.io) script. It runs in Docker against the full Compose stack: gateway, PostgreSQL, the simulator and Jaeger. After a 15-second warm-up, it sends 20 payments per second for 45 seconds. `K6_RATE` changes the rate. Each iteration:
+- creates a payment and checks that the outcome matches the card's last digit;
+- reads the payment back;
+- for 10% of iterations, replays the request with the same `Idempotency-Key` and checks that the original payment is returned.
+
+The run fails if any of these thresholds is crossed:
+
+| Metric | Threshold | Typical result |
+|---|---|---|
+| Failed requests | < 1% | 0% |
+| Checks passed | > 99% | 100% |
+| Create p95 / p99 | < 500 ms / < 1 s | 19 ms / 22 ms |
+| Retrieve p95 | < 200 ms | 4 ms |
+| Idempotent replay p95 | < 200 ms | 8 ms |
+
+The thresholds are generous on purpose: shared CI runners are noisy, and the goal is to catch regressions such as lock contention or connection-pool exhaustion, not to benchmark. If the default `postgres_data` volume was created with a different password, run the test in an isolated project: `docker compose -p perf --profile perf run --rm k6`, then `docker compose -p perf --profile perf down -v`.
+
+### Continuous integration
+
+`.github/workflows/build.yml` runs on every push to `main` and every pull request:
+1. **build**: `./gradlew build`, which runs unit tests, integration tests and the coverage gate. Test and coverage reports are uploaded as an artifact.
+2. **performance**: runs after `build` succeeds. It builds the Docker image, starts the stack, runs the k6 load test, prints the gateway logs if the test fails, and tears the stack down.
+
+### Manual checks
 
 The whole system was also checked by hand with `docker compose up --build` against the simulator:
 - A card ending in an odd digit came back Authorized.
@@ -349,10 +399,9 @@ The whole system was also checked by hand with `docker compose up --build` again
   
   The JVM is sized from the container's memory limit (`MaxRAMPercentage`).
 - **Configuration through environment variables.** For example, `BANK_URL` points the gateway at the bank; Compose sets it to the simulator's container.
-- **GitHub Actions** (`.github/workflows/build.yml`) builds, runs the tests and builds the Docker image on every push and pull request.
+- **GitHub Actions** (`.github/workflows/build.yml`) runs the full test suite with the coverage gate, then a k6 load test against the Docker stack, on every push and pull request (see [Continuous integration](#continuous-integration)).
 
 ## What I'd do next
-
 
 
 1. **Integrate the acquiring bank's official settlement feed**, replacing the provisional CSV contract and agreeing how the bank represents captures, reversals, fees, and settlement dates.

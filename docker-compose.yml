@@ -24,6 +24,9 @@ services:
       - type: bind
         source: ./imposters
         target: /imposters
+    networks:
+      default:
+        aliases: [bank-simulator]
 
   jaeger:
     image: jaegertracing/jaeger:2.21.0
@@ -38,7 +41,7 @@ services:
       - "8090:8090"
       - "127.0.0.1:8091:8091"
     environment:
-      BANK_URL: http://bank_simulator:8080
+      BANK_URL: http://bank-simulator:8080
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment_gateway
       SPRING_DATASOURCE_USERNAME: payment_gateway
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
@@ -48,12 +51,30 @@ services:
       MANAGEMENT_OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
     volumes:
       - ${BANK_RECONCILIATION_DIRECTORY:-./settlements}:/app/settlements:ro
+    networks:
+      default:
+        # Underscores are invalid in hostnames; Tomcat and the JDK HTTP client reject them
+        aliases: [payment-gateway]
     depends_on:
       bank_simulator:
         condition: service_started
       jaeger:
         condition: service_started
       postgres:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["perf"]
+    command: run /scripts/payments.js
+    environment:
+      BASE_URL: http://payment-gateway:8090
+      GATEWAY_ADMIN_API_KEY: ${GATEWAY_ADMIN_API_KEY:?Set GATEWAY_ADMIN_API_KEY}
+      RATE: ${K6_RATE:-20}
+    volumes:
+      - ./perf:/scripts:ro
+    depends_on:
+      payment_gateway:
         condition: service_healthy
 
 volumes:

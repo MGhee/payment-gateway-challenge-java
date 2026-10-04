@@ -7,6 +7,7 @@ on:
 
 jobs:
   build:
+    name: Unit and integration tests, coverage gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -15,7 +16,34 @@ jobs:
           distribution: temurin
           java-version: 17
           cache: gradle
+      # Integration tests start PostgreSQL and the bank simulator with Testcontainers
       - name: Build and test
         run: ./gradlew build
-      - name: Build Docker image
-        run: docker build -t payment-gateway .
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            build/reports/tests
+            build/reports/jacoco
+
+  performance:
+    name: Load test (k6)
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: ci-only-password
+      GATEWAY_ADMIN_API_KEY: ci-only-admin-key
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the gateway image
+        run: docker compose build payment_gateway
+      - name: Run the load test against the full stack
+        run: docker compose --profile perf run --rm k6
+      - name: Gateway logs
+        if: failure()
+        run: docker compose logs payment_gateway --tail 200
+      - name: Stop the stack
+        if: always()
+        run: docker compose --profile perf down -v

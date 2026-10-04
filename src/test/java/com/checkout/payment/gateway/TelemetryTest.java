@@ -34,7 +34,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jayway.jsonpath.JsonPath;
 
-@SpringBootTest(properties = "bank.reversal-retry-interval=PT1H")
+@SpringBootTest(properties = {"bank.reversal-retry-interval=PT1H",
+    "gateway.admin-api-key=test-admin-secret", "bank.url=http://localhost:8080"})
 @AutoConfigureMockMvc
 @AutoConfigureObservability(metrics = false)
 @ExtendWith(OutputCaptureExtension.class)
