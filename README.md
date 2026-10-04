@@ -360,7 +360,7 @@ Log levels:
 
 1. **Unit and Spring MVC tests** (`src/test`) run in-process against H2 and mocks.
 2. **Integration tests** (`src/integrationTest`) start the real application on a random port. It uses a PostgreSQL 16 container plus either the Mountebank simulator or a fault-injecting WireMock bank.
-3. **A coverage gate.** JaCoCo merges both suites and requires at least 90% line and 80% branch coverage. Coverage is currently about 95% of lines and 83% of branches. The HTML report is at `build/reports/jacoco/test/html/index.html`.
+3. **A coverage gate.** JaCoCo merges both suites and requires at least 90% line and 80% branch coverage. Coverage is currently about 96% of lines and 85% of branches. The HTML report is at `build/reports/jacoco/test/html/index.html`.
 
 ### Unit and Spring MVC tests
 
@@ -458,6 +458,19 @@ The whole system was also checked by hand with `docker compose up --build` again
 
 ## What I'd do next
 
+Known limitations, in rough order of risk:
+
+- **The per-merchant limit is per instance.** With N instances, a merchant can have N × 10 payments in progress. A shared counter, in Redis or PostgreSQL, would make it global. The bank bulkhead is per instance too, so total bank concurrency is N × 20 and must fit the bank's own limit.
+- **A duplicate reversal is still possible** if a lease expires during a stall longer than the whole batch timeout. It relies on the bank treating a repeated reversal for the same reference as a no-op.
+- **Local throttling returns `502`.** When the circuit is open or the bank bulkhead is full, the bank was never called; `503` with `Retry-After` would say so more precisely.
+- **Amounts are `int` and the currency list is fixed.** Production needs `long` amounts and each currency's minor-unit exponent (JPY has 0 decimals, KWD has 3).
+
+Next steps:
 
 1. **Integrate the acquiring bank's official settlement feed**, replacing the provisional CSV contract and agreeing how the bank represents captures, reversals, fees, and settlement dates.
 2. **Webhooks**, so merchants learn when a Pending payment becomes final without polling.
+3. **Publish and deploy the image.** Tag it with the git SHA, scan it, generate an SBOM, sign it and push it to a registry. Deploy with probes on `8091`, at least 3 replicas, a PodDisruptionBudget and a 50-second termination grace period.
+4. **Run Flyway as a pre-deploy job** with expand/contract migrations, instead of at application startup.
+5. **Mutation testing (PIT)** to measure how strong the tests are, not just what they cover, and an OpenAPI diff in CI to catch breaking API changes.
+6. **Tokenize card data at the edge**, so most of the gateway falls outside PCI DSS scope.
+7. **A runbook** for a payment stuck in Pending, an open circuit and reconciliation discrepancies, plus tail-based trace sampling through an OpenTelemetry Collector.

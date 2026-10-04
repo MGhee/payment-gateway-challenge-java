@@ -14,6 +14,7 @@ import com.checkout.payment.gateway.repository.PaymentStore;
 import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -94,7 +95,7 @@ public class PaymentGatewayService {
       return takenOverByRecovery(pending);
     } catch (BankOutcomeUnknownException e) {
       LOG.warn("Bank outcome unknown for payment {}, scheduling reversal", pending.id(), e);
-      payment = pending.withUnknownOutcome(java.time.Instant.now());
+      payment = pending.withUnknownOutcome(Instant.now());
     }
     if (!paymentsRepository.transition(pending, payment)) {
       return takenOverByRecovery(pending);

@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
@@ -46,8 +47,8 @@ public class GatewayAdminAuthenticationInterceptor implements HandlerInterceptor
     response.setHeader("WWW-Authenticate", "AdminKey realm=\"gateway-admin\"");
     response.setContentType("application/problem+json");
     objectMapper.writeValue(response.getOutputStream(), ProblemDetails.create(
-      org.springframework.http.HttpStatus.UNAUTHORIZED, "admin-authentication-required",
-      "Gateway administrator authentication required", request));
+        HttpStatus.UNAUTHORIZED, "admin-authentication-required",
+        "Gateway administrator authentication required", request));
     return false;
   }
 }

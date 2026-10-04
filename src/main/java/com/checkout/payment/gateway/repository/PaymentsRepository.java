@@ -11,15 +11,15 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Repository
 public class PaymentsRepository implements PaymentStore {
@@ -104,7 +104,7 @@ public class PaymentsRepository implements PaymentStore {
     return queryOne("SELECT p." + COLUMNS.replace(", ", ", p.") + " FROM payments p "
         + "JOIN payment_idempotency_keys k ON k.payment_id = p.id "
         + "WHERE k.merchant_id = ? AND k.idempotency_key = ? AND k.expires_at > ?",
-      merchantId, idempotencyKey, Timestamp.from(clock.instant()));
+        merchantId, idempotencyKey, Timestamp.from(clock.instant()));
   }
 
   @Override
@@ -149,21 +149,21 @@ public class PaymentsRepository implements PaymentStore {
   public int purgeExpiredIdempotencyKeys(Instant now) {
     jdbcTemplate.update("UPDATE payments SET idempotency_key = NULL WHERE id IN "
         + "(SELECT payment_id FROM payment_idempotency_keys WHERE expires_at <= ?)",
-      Timestamp.from(now));
+        Timestamp.from(now));
     return jdbcTemplate.update("DELETE FROM payment_idempotency_keys WHERE expires_at <= ?",
         Timestamp.from(now));
   }
 
-    private void clearExpiredIdempotencyKey(String merchantId, String idempotencyKey, Instant now) {
+  private void clearExpiredIdempotencyKey(String merchantId, String idempotencyKey, Instant now) {
     Timestamp timestamp = Timestamp.from(now);
     jdbcTemplate.update("UPDATE payments SET idempotency_key = NULL WHERE id IN "
         + "(SELECT payment_id FROM payment_idempotency_keys WHERE merchant_id = ? "
         + "AND idempotency_key = ? AND expires_at <= ?)",
-      merchantId, idempotencyKey, timestamp);
+        merchantId, idempotencyKey, timestamp);
     jdbcTemplate.update("DELETE FROM payment_idempotency_keys WHERE merchant_id = ? "
         + "AND idempotency_key = ? AND expires_at <= ?",
-      merchantId, idempotencyKey, timestamp);
-    }
+        merchantId, idempotencyKey, timestamp);
+  }
 
   private void insertPayment(Payment payment) {
     String sql = "INSERT INTO payments (" + COLUMNS

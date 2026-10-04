@@ -137,50 +137,50 @@ class BankClientTest {
         .isInstanceOf(AcquiringBankException.class);
   }
 
-      @Test
-      void openCircuitRejectsAuthorizationWithoutCallingTheBank() {
-      CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+  @Test
+  void openCircuitRejectsAuthorizationWithoutCallingTheBank() {
+    CircuitBreakerConfig config = CircuitBreakerConfig.custom()
         .slidingWindowSize(2)
         .minimumNumberOfCalls(2)
         .failureRateThreshold(50)
         .waitDurationInOpenState(Duration.ofMinutes(1))
         .build();
-      BankClient guardedClient = new BankClient(restTemplate,
+    BankClient guardedClient = new BankClient(restTemplate,
         CircuitBreaker.of("open-bank", config), Bulkhead.ofDefaults("open-bank"));
-      bank.expect(requestTo("http://bank/payments"))
+    bank.expect(requestTo("http://bank/payments"))
         .andRespond(withStatus(HttpStatusCode.valueOf(503)));
-      bank.expect(requestTo("http://bank/payments"))
+    bank.expect(requestTo("http://bank/payments"))
         .andRespond(withStatus(HttpStatusCode.valueOf(503)));
 
-      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+    assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
         .isInstanceOf(AcquiringBankException.class);
-      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+    assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
         .isInstanceOf(AcquiringBankException.class);
-      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+    assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
         .isInstanceOf(BankCallRejectedException.class);
-      assertThatThrownBy(() -> guardedClient.reverse(REFERENCE))
+    assertThatThrownBy(() -> guardedClient.reverse(REFERENCE))
         .isInstanceOf(BankCallRejectedException.class);
 
-      bank.verify();
-      }
+    bank.verify();
+  }
 
-      @Test
-      void fullBulkheadRejectsAuthorizationWithoutCallingTheBank() {
-      BulkheadConfig config = BulkheadConfig.custom()
+  @Test
+  void fullBulkheadRejectsAuthorizationWithoutCallingTheBank() {
+    BulkheadConfig config = BulkheadConfig.custom()
         .maxConcurrentCalls(1)
         .maxWaitDuration(Duration.ZERO)
         .build();
-      Bulkhead bulkhead = Bulkhead.of("full-bank", config);
-      assertThat(bulkhead.tryAcquirePermission()).isTrue();
-      BankClient guardedClient = new BankClient(restTemplate,
+    Bulkhead bulkhead = Bulkhead.of("full-bank", config);
+    assertThat(bulkhead.tryAcquirePermission()).isTrue();
+    BankClient guardedClient = new BankClient(restTemplate,
         CircuitBreaker.ofDefaults("full-bank"), bulkhead);
 
-      assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
+    assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
         .isInstanceOf(BankCallRejectedException.class);
-      assertThatThrownBy(() -> guardedClient.reverse(REFERENCE))
+    assertThatThrownBy(() -> guardedClient.reverse(REFERENCE))
         .isInstanceOf(BankCallRejectedException.class);
 
-      bulkhead.releasePermission();
-      bank.verify();
-      }
+    bulkhead.releasePermission();
+    bank.verify();
+  }
 }

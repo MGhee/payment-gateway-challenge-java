@@ -1,12 +1,14 @@
 package com.checkout.payment.gateway;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import java.net.URI;
 import java.time.Year;
 import java.time.ZoneOffset;
 import java.util.Map;
 import java.util.UUID;
-
-import static org.assertj.core.api.Assertions.assertThat;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -21,10 +23,6 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
-
-import com.fasterxml.jackson.databind.JsonNode;
-
-import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = {
     "gateway.admin-api-key=" + IntegrationTestBase.ADMIN_KEY,
