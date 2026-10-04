@@ -1,11 +1,14 @@
 // Load test for the payment API: run with `docker compose --profile perf run --rm k6`
 import http from 'k6/http';
 import { check, fail } from 'k6';
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.1.0/index.js';
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8090';
 const RATE = Number(__ENV.RATE || 20);
+const RESULTS_DIR = __ENV.RESULTS_DIR || '/results';
 
 export const options = {
+  summaryTrendStats: ['avg', 'med', 'p(95)', 'p(99)', 'max'],
   scenarios: {
     // JIT and connection-pool warm-up, excluded from the thresholds
     warmup: {
@@ -88,4 +91,39 @@ export default function (data) {
         && r.json('id') === created.json('id'),
     });
   }
+}
+
+export function handleSummary(data) {
+  return {
+    stdout: textSummary(data, { indent: ' ', enableColors: true }),
+    [`${RESULTS_DIR}/summary.md`]: markdownSummary(data),
+    [`${RESULTS_DIR}/summary.json`]: JSON.stringify(data, null, 2),
+  };
+}
+
+// Rendered in the GitHub Actions job summary
+function markdownSummary(data) {
+  const rows = [];
+  for (const [metric, { values, thresholds }] of Object.entries(data.metrics)) {
+    for (const [expression, { ok }] of Object.entries(thresholds || {})) {
+      const stat = expression.match(/^[a-z]+(\([\d.]+\))?/)[0];
+      const result = stat === 'rate'
+        ? `${(values.rate * 100).toFixed(2)}%`
+        : `${values[stat].toFixed(1)} ms`;
+      rows.push(`| \`${metric}\` | \`${expression}\` | ${result} | ${ok ? '✅' : '❌'} |`);
+    }
+  }
+  const checks = data.metrics.checks.values;
+  return [
+    '### Load test (k6)',
+    '',
+    '| Metric | Threshold | Result | Passed |',
+    '|---|---|---|---|',
+    ...rows.sort(),
+    '',
+    `${data.metrics.iterations.values.count} iterations, `
+      + `${data.metrics.http_reqs.values.count} requests, `
+      + `${checks.passes} of ${checks.passes + checks.fails} checks passed.`,
+    '',
+  ].join('\n');
 }

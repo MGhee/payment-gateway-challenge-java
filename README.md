@@ -387,11 +387,25 @@ The run fails if any of these thresholds is crossed:
 
 The thresholds are generous on purpose: shared CI runners are noisy, and the goal is to catch regressions such as lock contention or connection-pool exhaustion, not to benchmark. If the default `postgres_data` volume was created with a different password, run the test in an isolated project: `docker compose -p perf --profile perf run --rm k6`, then `docker compose -p perf --profile perf down -v`.
 
+Besides the console summary, k6 writes `build/k6/summary.md`, a threshold table, and `build/k6/summary.json`, the raw results. On Linux, run `mkdir -p build/k6 && chmod a+w build/k6` first, because k6 runs as an unprivileged user inside its container.
+
 ### Continuous integration
 
 `.github/workflows/build.yml` runs on every push to `main` and every pull request:
-1. **build**: `./gradlew build`, which runs unit tests, integration tests and the coverage gate. Test and coverage reports are uploaded as an artifact.
+1. **build**: `./gradlew build`, which runs unit tests, integration tests and the coverage gate.
 2. **performance**: runs after `build` succeeds. It builds the Docker image, starts the stack, runs the k6 load test, prints the gateway logs if the test fails, and tears the stack down.
+
+Where to find the results of a run, under the repository's **Actions** tab, **Build** workflow:
+
+| What | Where |
+|---|---|
+| Failed tests | Annotations on the run page and on the pull request's changed files. Each one has the test name, the assertion message and the source line |
+| Test counts | The run's **Summary** page has a table of passed, failed and skipped tests for both suites, with details for every failure |
+| Coverage | The same **Summary** page has line and branch coverage for unit and integration tests combined |
+| Load test | The **Summary** page shows each k6 threshold with its measured value and a pass/fail mark |
+| Full reports | **Artifacts** at the bottom of the **Summary** page: `test-reports` has the HTML test and JaCoCo reports, and `load-test-results` has the k6 summary files |
+
+With the GitHub CLI, `gh run view --log-failed` shows only the failing steps, and `gh run download -n test-reports` fetches the HTML reports.
 
 ### Manual checks
 

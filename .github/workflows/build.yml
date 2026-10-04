@@ -19,6 +19,30 @@ jobs:
       # Integration tests start PostgreSQL and the bank simulator with Testcontainers
       - name: Build and test
         run: ./gradlew build
+      # Failed tests become annotations on the run and pull request, plus a job summary table
+      - name: Publish test results
+        if: always()
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: build/test-results/**/TEST-*.xml
+          annotate_only: true
+          detailed_summary: true
+          include_passed: false
+      - name: Publish coverage summary
+        if: always() && hashFiles('build/reports/jacoco/test/jacocoTestReport.xml') != ''
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import xml.etree.ElementTree as ET
+          report = ET.parse('build/reports/jacoco/test/jacocoTestReport.xml').getroot()
+          print('### Coverage (unit and integration tests)\n')
+          print('| Counter | Covered |')
+          print('|---|---|')
+          for counter in report.findall('counter'):
+              if counter.get('type') in ('LINE', 'BRANCH'):
+                  missed, covered = int(counter.get('missed')), int(counter.get('covered'))
+                  total = missed + covered
+                  print(f"| {counter.get('type').title()} | {covered / total:.1%} ({covered}/{total}) |")
+          EOF
       - name: Upload test and coverage reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -40,7 +64,19 @@ jobs:
       - name: Build the gateway image
         run: docker compose build payment_gateway
       - name: Run the load test against the full stack
-        run: docker compose --profile perf run --rm k6
+        run: |
+          # k6 runs as an unprivileged user and writes its summary here
+          mkdir -p build/k6 && chmod a+w build/k6
+          docker compose --profile perf run --rm k6
+      - name: Publish load test summary
+        if: always() && hashFiles('build/k6/summary.md') != ''
+        run: cat build/k6/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload load test results
+        if: always() && hashFiles('build/k6/summary.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results
+          path: build/k6
       - name: Gateway logs
         if: failure()
         run: docker compose logs payment_gateway --tail 200

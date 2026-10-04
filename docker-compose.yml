@@ -75,6 +75,7 @@ services:
       RATE: ${K6_RATE:-20}
     volumes:
       - ./perf:/scripts:ro
+      - ./build/k6:/results
     depends_on:
       payment_gateway:
         condition: service_healthy
