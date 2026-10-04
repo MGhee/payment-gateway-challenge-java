@@ -27,11 +27,11 @@ The admin key provisions merchant keys and is not used for payment requests. Use
 
 | What | Command |
 |---|---|
-| Everything in Docker (gateway and bank simulator) | `docker compose up --build` |
+| Everything in Docker (gateway, bank simulator, PostgreSQL and Jaeger) | `docker compose up --build` |
 | Gateway locally, database and simulator in Docker | `docker compose up postgres bank_simulator`, then `./gradlew bootRun` |
 | Build and run all tests | `./gradlew build` |
 
-The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger UI) are at **http://localhost:8090/swagger-ui/index.html**. The simulator decides the outcome from the last digit of the card number:
+The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger UI) are at **http://localhost:8090/swagger-ui/index.html**. Actuator endpoints are on a separate management port, **http://localhost:8091/actuator**, and traces are in Jaeger at **http://localhost:16686** (see [Observability](#observability)). The simulator decides the outcome from the last digit of the card number:
 
 | Last digit | Result |
 |---|---|
@@ -263,17 +263,43 @@ How this works, as in real gateways:
   Against the simulator, reversals fail and end in manual reconciliation. A timeout never happens with the simulator unless it is forced, for example with `BANK_READ_TIMEOUT=1ms`.
 - **Idempotency keys are merchant-scoped and retained for 72 hours by default.** This can be changed with `gateway.idempotency-retention`.
 - **Merchant API keys expire after one year by default.** Operators can provision, rotate, and revoke them through the admin API.
-- **PostgreSQL is the chosen transactional store for this implementation.** Checkout.com's internal database technology is not publicly documented, so this is a project design choice rather than a claim about its production stack.
+- **PostgreSQL is the chosen transactional store for this implementation.** 
 - **Settlement files use an assumed adapter contract.** The bank simulator has no settlement feed. Until the acquiring bank's actual format is known, the adapter expects one CSV per UTC day named `settlement-YYYY-MM-DD.csv`, with `reference,amount,currency,status` columns and `AUTHORIZED`, `DECLINED`, or `PENDING` status values.
 
 ## Observability
 
 | Signal | Where |
 |---|---|
-| Liveness and readiness | `/actuator/health/liveness`, `/actuator/health/readiness`. These suit Kubernetes probes and the Docker `HEALTHCHECK` |
-| Build and version info | `/actuator/info` |
-| Metrics, in Prometheus format | `/actuator/prometheus` (see below) |
-| Logs | Every log line includes the request id, e.g. `INFO [smoke-test-1] ... Payment fa35609c... Authorized: 100 GBP` |
+| Liveness and readiness | `:8091/actuator/health/liveness`, `:8091/actuator/health/readiness`. These suit Kubernetes probes and the Docker `HEALTHCHECK` |
+| Build and version info | `:8091/actuator/info` |
+| Metrics, in Prometheus format | `:8091/actuator/prometheus` (see below) |
+| Traces | OpenTelemetry, exported over OTLP. In Compose, open Jaeger at http://localhost:16686 and pick the `payment-gateway` service |
+| Logs | JSON in Compose, plain text under `bootRun`. Every line carries the request id, trace id and span id |
+
+### Separate actuator port
+
+Actuator runs on management port `8091` (`MANAGEMENT_SERVER_PORT`), separate from merchant traffic on `8090`. Health, metrics and build info can then stay off the public load balancer and be reached only from inside the network by probes and Prometheus. Compose publishes `8091` on `127.0.0.1` only.
+
+### Tracing
+
+- **W3C trace context is propagated end to end.** If the merchant sends a `traceparent` header, the gateway joins that trace; otherwise it starts a new one. Every call to the bank carries a `traceparent` header, so the bank's own spans can join the same trace.
+- **Background work is traced too.** Each run of a `@Scheduled` job (reversals, stale-authorization recovery, reconciliation) gets its own trace, so a reversal's bank call can be found as well.
+- **Export is opt-in.** Spans go over OTLP/HTTP only when `MANAGEMENT_OTLP_TRACING_ENDPOINT` is set. Compose points it at the bundled Jaeger. To export from `bootRun`, run `docker compose up postgres bank_simulator jaeger` and set `MANAGEMENT_OTLP_TRACING_ENDPOINT=http://localhost:4318/v1/traces`.
+- **Sampling** is 100% by default. At production volumes, lower it with `MANAGEMENT_TRACING_SAMPLING_PROBABILITY`. The gateway honors the sampling decision in an incoming `traceparent`, so a public edge should strip or re-root merchant trace headers.
+
+Card data never appears in spans. Request and response bodies aren't recorded, and card details are never part of a URL.
+
+### Structured logs
+
+The `json-logs` Spring profile (`SPRING_PROFILES_ACTIVE=json-logs`, which Compose sets) writes one JSON object per line in Logstash format, ready for Loki, Elasticsearch or CloudWatch. Request-scoped values become top-level fields, so you can filter by `requestId` or jump from a log line to its trace:
+
+```json
+{"@timestamp":"2026-10-04T13:24:02.719Z","message":"Payment 021de997-2868-4e54-bf39-1dd4a0cdd7a2 Authorized: 100 GBP","logger_name":"com.checkout.payment.gateway.service.PaymentGatewayService","thread_name":"http-nio-8090-exec-1","level":"INFO","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"7a4495710d074337","requestId":"smoke-test-1","service":"payment-gateway"}
+```
+
+JSON encoding escapes newlines, which is a second defence against forged log lines. Without the profile, logs stay as readable text with the same ids in the prefix: `INFO [smoke-test-1] ... [4bf92f35...-7a449571...] ... Payment 021de997... Authorized: 100 GBP`.
+
+### Metrics and log levels
 
 Metrics:
 - `payments_processed_total{status="Authorized", "Declined" or "Pending"}` counts outcomes, to track the authorization rate. A rise in `Pending` means the bank is timing out.
@@ -300,6 +326,7 @@ Log levels:
 | `PaymentAuthorizationRecoveryJobTest` | Plain unit test | Stale in-flight authorizations become durable reversal work after a restart |
 | `SettlementReconciliationServiceTest` | Plain unit test | Matched rows, amount/currency/status mismatches, unknown/duplicate/missing references, Pending payments, and invalid headers |
 | `FutureExpiryDateValidatorTest` | Plain unit test with a fixed `Clock` | Expiry boundaries: the current month is valid and the previous month is not |
+| `TelemetryTest` | Full Spring context with tracing enabled; the bank is a `MockRestServiceServer` | An incoming `traceparent` reaches the bank request and the log context, and the `json-logs` profile writes one JSON object per line with MDC fields |
 
 The whole system was also checked by hand with `docker compose up --build` against the simulator:
 - A card ending in an odd digit came back Authorized.
@@ -318,7 +345,7 @@ The whole system was also checked by hand with `docker compose up --build` again
 
 - **Dockerfile.** Built in two stages:
   1. A JDK image builds the jar, with Gradle's cache kept between builds.
-  2. The jar runs on a slim JRE image as a non-root user, with a health check.
+  2. The jar runs on a slim JRE image as a non-root user, with a health check against the management port.
   
   The JVM is sized from the container's memory limit (`MaxRAMPercentage`).
 - **Configuration through environment variables.** For example, `BANK_URL` points the gateway at the bank; Compose sets it to the simulator's container.
@@ -326,8 +353,7 @@ The whole system was also checked by hand with `docker compose up --build` again
 
 ## What I'd do next
 
-Credential lifecycle, API versioning, and RFC 7807 errors are implemented. Before production, the next priorities would be:
+
 
 1. **Integrate the acquiring bank's official settlement feed**, replacing the provisional CSV contract and agreeing how the bank represents captures, reversals, fees, and settlement dates.
 2. **Webhooks**, so merchants learn when a Pending payment becomes final without polling.
-3. **Better telemetry**, including OpenTelemetry trace propagation, structured logs, and a separate actuator port.
