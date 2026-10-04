@@ -11,14 +11,19 @@ import com.checkout.payment.gateway.service.SettlementReconciliationService;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.PlatformTransactionManager;
 
 class PostgresPersistenceIntegrationTest extends IntegrationTestBase {
 
@@ -27,6 +32,8 @@ class PostgresPersistenceIntegrationTest extends IntegrationTestBase {
 
   @Autowired
   private PaymentsRepository payments;
+  @Autowired
+  private PlatformTransactionManager transactionManager;
   @Autowired
   private PaymentAuthorizationRecoveryJob recoveryJob;
   @Autowired
@@ -77,8 +84,45 @@ class PostgresPersistenceIntegrationTest extends IntegrationTestBase {
 
     recoveryJob.recoverStaleAuthorizations();
 
-    assertThat(payments.findDueReversals(Instant.now())).extracting(Payment::id)
-        .contains(stale.id());
+    Instant now = Instant.now();
+    assertThat(payments.claimDueReversals(now, now.plusSeconds(60), 100))
+        .extracting(Payment::id).contains(stale.id());
+  }
+
+  @Test
+  void claimedReversalIsLeasedToOneWorker() {
+    Payment unknown = Payment.pending(REQUEST, null, merchantId);
+    payments.addIfKeyUnused(unknown);
+    payments.transition(unknown, unknown.withUnknownOutcome(Instant.now()));
+    Instant now = Instant.now();
+
+    List<Payment> first = payments.claimDueReversals(now, now.plusSeconds(60), 100);
+    List<Payment> second = payments.claimDueReversals(now, now.plusSeconds(60), 100);
+
+    assertThat(first).extracting(Payment::id).contains(unknown.id());
+    assertThat(second).extracting(Payment::id).doesNotContain(unknown.id());
+  }
+
+  @Test
+  void keyFreedBetweenTheConflictAndTheLookupIsReservedOnRetry() {
+    Payment original = Payment.pending(REQUEST, "vanishing", merchantId);
+    payments.addIfKeyUnused(original);
+    AtomicBoolean originalFails = new AtomicBoolean(true);
+    PaymentsRepository racing = new PaymentsRepository(jdbc, transactionManager,
+        Clock.systemUTC(), Duration.ofHours(72)) {
+      @Override
+      public Optional<Payment> getByIdempotencyKey(String merchant, String key) {
+        // The original's bank call fails and frees the key just after our insert conflicted
+        if (originalFails.getAndSet(false)) {
+          payments.removeInFlight(original);
+        }
+        return super.getByIdempotencyKey(merchant, key);
+      }
+    };
+    Payment retry = Payment.pending(REQUEST, "vanishing", merchantId);
+
+    assertThat(racing.addIfKeyUnused(retry)).isEmpty();
+    assertThat(payments.getByIdempotencyKey(merchantId, "vanishing")).contains(retry);
   }
 
   @Test

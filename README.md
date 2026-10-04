@@ -144,6 +144,7 @@ Returns the same body as above with **`200 OK`**, or **`404 Not Found`** if no p
 | `404 Not Found` | No payment with that id | Problem Details on `/v1`; legacy error JSON on `/payments` |
 | `409 Conflict` | A request with the same `Idempotency-Key` is still being processed | Problem Details on `/v1`; legacy error JSON on `/payments` |
 | `422 Unprocessable Entity` | The `Idempotency-Key` was already used for a different payment during its retention period | Problem Details on `/v1`; legacy error JSON on `/payments` |
+| `429 Too Many Requests` | The merchant already has too many payments in progress. Nothing was stored; retry after the `Retry-After` delay | Problem Details on `/v1`; legacy error JSON on `/payments` |
 | `502 Bad Gateway` | The bank returned an error or couldn't be reached, so nothing was authorized. No payment was kept and it is safe to retry | Problem Details on `/v1`; legacy error JSON on `/payments` |
 
 Every response carries an `X-Request-Id` header. If the merchant sends one, it is echoed back; otherwise the gateway generates one. The same id appears in every log line for that request.
@@ -232,13 +233,27 @@ When in doubt, the gateway assumes the bank might have authorized the payment. A
 How this works, as in real gateways:
 
 - **The payment is stored as Pending before the bank is called.** Our payment id goes to the bank as the `reference`, so the payment can be identified later even if no response ever arrives.
-- **Timeout reversal.** `PaymentReversalJob` scans persisted Pending rows and sends `POST /reversals {"reference": ...}` to the bank. Each payment stores its attempt count and next retry time; delays grow exponentially from `bank.reversal-retry-base-delay`:
+- **Timeout reversal.** `PaymentReversalJob` claims due Pending rows (see [Concurrency](#concurrency)) and sends `POST /reversals {"reference": ...}` to the bank. Each payment stores its attempt count and next retry time; delays grow exponentially from `bank.reversal-retry-base-delay`:
   - If the reversal succeeds, the payment becomes **Declined** and no money is held.
   - After `bank.reversal-max-attempts` failures, it stays **Pending**. An ERROR log and the `payments_reversals_total{outcome="failed"}` metric flag it for **manual reconciliation** against the bank's settlement report.
+  - Only attempts that reach the bank count. If the circuit breaker is open or the bank bulkhead is full, the reversal is deferred by `bank.reversal-retry-base-delay` without using an attempt, so heavy payment traffic can't push a payment into manual reconciliation.
 - **Idempotency keys** let the merchant retry safely. A retry after a timeout returns the Pending payment, and later its final status, instead of charging again.
   - The key is reserved atomically together with the Pending payment, so two simultaneous duplicates can't both reach the bank.
   - Since the card number and CVV are never stored, a retry is recognised as "the same payment" by its last four digits, expiry, currency and amount.
 - **The gateway itself never resends a payment to the bank.** Bank calls use the JDK `HttpClient`, which does not retry POSTs. OkHttp and `HttpURLConnection` both silently resend a POST after a connection reset, which could authorize the same payment twice. `BankFailureIntegrationTest` resets the connection and checks that the bank sees exactly one request.
+
+### Concurrency
+
+Every guarantee below is enforced by PostgreSQL, not by in-memory locks. It therefore holds across several gateway instances, and `ConcurrencyIntegrationTest` exercises each one.
+
+| Who races | What could go wrong | How it's prevented |
+|---|---|---|
+| Requests with the same `Idempotency-Key` | Both reach the bank | The key and the payment are inserted in one transaction behind a unique key. Losers get `409` while the winner is in flight and the original payment afterwards. If the winner fails and frees the key between a loser's conflict and its lookup, the loser retries the reservation instead of returning `500` |
+| A burst from one merchant | It takes every bank connection and other merchants get `502`s | Each merchant may have at most `gateway.merchant-max-concurrent-payments` (default 10) payments in progress per instance. Extra requests get `429` with `Retry-After: 1`, before anything is stored. The shared bank bulkhead (20 calls) waits up to `bank.bulkhead.max-wait-duration` (500 ms) for a free slot |
+| A request against the recovery job | A request stalls past the recovery threshold, its payment is queued for reversal, and the late bank answer then overwrites the outcome | Payment updates are compare-and-set: the request records its outcome only if the payment is still in flight. If the recovery job got there first, the merchant receives the payment as it now stands (Pending, then Declined) and the reversal releases any funds |
+| Two instances running the reversal job | The same payment is reversed twice, or a late failure flips Declined back to Pending | Each instance claims due payments with `SELECT … FOR UPDATE SKIP LOCKED` and leases them for the duration of its bank calls. Outcomes are compare-and-set, so a stale worker never overwrites a newer state. If an instance dies mid-batch, its lease expires and another instance picks the payments up |
+
+If a lease expires while its holder is still running (a stall longer than the whole batch timeout), a second worker can send the same reversal again. That is the only duplicate left. Reversals are keyed by our payment reference, so the acquiring bank is expected to treat a repeat as a no-op.
 
 ### Card data and security
 
@@ -306,7 +321,7 @@ JSON encoding escapes newlines, which is a second defence against forged log lin
 
 Metrics:
 - `payments_processed_total{status="Authorized", "Declined" or "Pending"}` counts outcomes, to track the authorization rate. A rise in `Pending` means the bank is timing out.
-- `payments_reversals_total{outcome="reversed" or "failed"}` counts reversals. **Alert on `failed`**: each one is a payment that needs manual reconciliation.
+- `payments_reversals_total{outcome="reversed", "failed" or "deferred"}` counts reversals. **Alert on `failed`**: each one is a payment that needs manual reconciliation. A sustained rise in `deferred` means reversals are being held back by the circuit breaker or the bulkhead.
 - `payments_reconciliation_reports_total{outcome="completed", "duplicate", "missing" or "invalid"}` tracks daily report handling; `payments_reconciliation_issues_total` counts discrepancies.
 - `http_server_requests_seconds` gives our own latency and error rate, broken down by status code. Rejections show up here as `400`s.
 - `http_client_requests_seconds` gives the bank's latency and its error responses.
@@ -329,9 +344,9 @@ Log levels:
 | Test class | Type | What it covers |
 |---|---|---|
 | `PaymentGatewayControllerTest` | Full Spring context with MockMvc. Only `BankClient` is mocked | Legacy and `/v1` payment routes, versioned locations, RFC 7807 errors, merchant isolation, admin-only key provisioning, hash-only storage, rotation/revocation, idempotency expiry, and the payment validation/status contract |
-| `BankClientTest` | `MockRestServiceServer` | The exact JSON sent to the bank (reference, snake_case, zero-padded `MM/YYYY` expiry), the reversal call, and sorting each failure into the right group: error statuses and "connection refused" mean nothing was authorized; timeouts and unreadable bodies mean the outcome is unknown |
-| `PaymentGatewayServiceTest` | Plain unit test | Pending is stored before the bank call, merchant-scoped idempotency, status mapping, card data minimization, and failure behavior |
-| `PaymentReversalJobTest` | Plain unit test | Persisted reversal work, retry behavior, terminal manual-reconciliation state, and metrics |
+| `BankClientTest` | `MockRestServiceServer` | The exact JSON sent to the bank (reference, snake_case, zero-padded `MM/YYYY` expiry), the reversal call, and sorting each failure into the right group: error statuses and "connection refused" mean nothing was authorized; timeouts and unreadable bodies mean the outcome is unknown; an open circuit or full bulkhead is reported as rejected locally, without calling the bank |
+| `PaymentGatewayServiceTest` | Plain unit test | Pending is stored before the bank call, merchant-scoped idempotency, status mapping, card data minimization, failure behavior, the per-merchant concurrency limit, and a late bank answer never overwriting a payment the recovery job took over |
+| `PaymentReversalJobTest` | Plain unit test | Persisted reversal work, retry behavior, terminal manual-reconciliation state, metrics, a claimed payment not being picked up by a second worker, another worker's outcome never being overwritten, and locally rejected reversals being deferred without using an attempt |
 | `PaymentAuthorizationRecoveryJobTest` | Plain unit test | Stale in-flight authorizations become durable reversal work after a restart |
 | `SettlementReconciliationServiceTest` | Plain unit test | Matched rows, amount/currency/status mismatches, unknown/duplicate/missing references, Pending payments, and invalid headers |
 | `SettlementReconciliationJobTest` | Plain unit test with a fixed `Clock` | Which daily files are picked up (yesterday's and late earlier ones, not processed or future ones), and missing or invalid reports |
@@ -346,8 +361,10 @@ One PostgreSQL container is shared by every class for the whole run. Each test p
 | Test class | Bank | What it covers |
 |---|---|---|
 | `BankSimulatorIntegrationTest` | The Mountebank imposter used by Compose | The request contract against the real simulator: Authorized and Declined are returned, persisted and retrievable. A simulator error returns `502`, stores nothing and frees the idempotency key, which proves the `ON DELETE CASCADE` on PostgreSQL |
-| `BankFailureIntegrationTest` | WireMock over real sockets | A real read timeout returns `202` Pending, then the reversal job calls `/reversals` and the payment becomes Declined. A connection reset is an unknown outcome and **the bank receives exactly one POST**. Eight concurrent requests with the same `Idempotency-Key` reach the bank once and store one payment |
-| `PostgresPersistenceIntegrationTest` | None | Flyway migrations on PostgreSQL, an exact round trip of every payment column (UUID, `timestamptz` at microsecond precision), unique-key translation for duplicate idempotency keys and settlement reports, key expiry and reuse, stale-authorization recovery, and settlement issues stored once per day |
+| `BankFailureIntegrationTest` | WireMock over real sockets | A real read timeout returns `202` Pending, then the reversal job calls `/reversals` and the payment becomes Declined. A connection reset is an unknown outcome and **the bank receives exactly one POST** |
+| `ConcurrencyIntegrationTest` | WireMock over real sockets | Eight concurrent requests with the same `Idempotency-Key` reach the bank once and store one payment. A burst of 15 from one merchant gets exactly 10 × `201` and 5 × `429` while another merchant is still served. A late bank answer after a recovery takeover is reversed rather than recorded. Two reversal-job instances running at once send exactly one reversal |
+| `PostgresPersistenceIntegrationTest` | None | Flyway migrations on PostgreSQL, an exact round trip of every payment column (UUID, `timestamptz` at microsecond precision), unique-key translation for duplicate idempotency keys and settlement reports, key expiry and reuse, a key freed mid-conflict being reserved on retry, `SKIP LOCKED` reversal claims, stale-authorization recovery, and settlement issues stored once per day |
+| `GracefulShutdownIntegrationTest` | WireMock, with a gateway started and stopped by the test | Closing the gateway while a payment waits on the bank still returns `201` to the merchant, and a reversal in progress at shutdown is completed and recorded. With `server.shutdown=immediate`, the payment test fails with a dropped connection |
 
 Tests pin their own configuration inline, so environment variables exported for Compose, such as `GATEWAY_ADMIN_API_KEY`, can't change their behavior.
 
@@ -398,6 +415,7 @@ The whole system was also checked by hand with `docker compose up --build` again
   2. The jar runs on a slim JRE image as a non-root user, with a health check against the management port.
   
   The JVM is sized from the container's memory limit (`MaxRAMPercentage`).
+- **Graceful shutdown.** On `SIGTERM`, readiness switches to refusing traffic so the load balancer stops sending new requests. A running reversal batch finishes, then the server stops accepting connections and waits for in-flight payments. Each phase may take up to 20 seconds, which covers the bank's 2-second connect plus 10-second read timeout. Compose sets `stop_grace_period: 50s`; in Kubernetes, set `terminationGracePeriodSeconds` to at least 50. Anything still running after that is cut off; the recovery and reversal jobs handle it after the restart.
 - **Configuration through environment variables.** For example, `BANK_URL` points the gateway at the bank; Compose sets it to the simulator's container.
 - **GitHub Actions** (`.github/workflows/build.yml`) runs the full test suite with the coverage gate, then a k6 load test against the Docker stack, on every push and pull request (see [Continuous integration](#continuous-integration)).
 

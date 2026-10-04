@@ -1,6 +1,7 @@
 package com.checkout.payment.gateway.repository;
 
 import com.checkout.payment.gateway.enums.PaymentStatus;
+import com.checkout.payment.gateway.exception.IdempotencyConflictException;
 import com.checkout.payment.gateway.model.Payment;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -26,6 +27,7 @@ public class PaymentsRepository implements PaymentStore {
   private static final String COLUMNS = "id, merchant_id, status, card_number_last_four, "
       + "expiry_month, expiry_year, currency, amount, idempotency_key, created_at, "
       + "authorization_in_progress, reversal_attempts, next_reversal_at";
+  private static final int MAX_RESERVATION_ATTEMPTS = 3;
 
   private final JdbcTemplate jdbcTemplate;
   private final TransactionTemplate transactionTemplate;
@@ -47,36 +49,43 @@ public class PaymentsRepository implements PaymentStore {
       insertPayment(payment);
       return Optional.empty();
     }
-    try {
-      transactionTemplate.executeWithoutResult(transaction -> {
-        Instant now = clock.instant();
-        clearExpiredIdempotencyKey(payment.merchantId(), payment.idempotencyKey(), now);
-        insertPayment(payment);
-        jdbcTemplate.update("INSERT INTO payment_idempotency_keys "
-                + "(merchant_id, idempotency_key, payment_id, expires_at) VALUES (?, ?, ?, ?)",
-            payment.merchantId(), payment.idempotencyKey(), payment.id(),
-            Timestamp.from(now.plus(idempotencyRetention)));
-      });
-    } catch (DuplicateKeyException e) {
-      Optional<Payment> original = getByIdempotencyKey(payment.merchantId(), payment.idempotencyKey());
-      if (original.isPresent()) {
-        return original;
+    // The conflicting payment can be deleted (a bank failure frees its key) before it is read back
+    for (int attempt = 0; attempt < MAX_RESERVATION_ATTEMPTS; attempt++) {
+      try {
+        reserveKey(payment);
+        return Optional.empty();
+      } catch (DuplicateKeyException e) {
+        Optional<Payment> original =
+            getByIdempotencyKey(payment.merchantId(), payment.idempotencyKey());
+        if (original.isPresent()) {
+          return original;
+        }
       }
-      throw e;
     }
-    return Optional.empty();
+    throw new IdempotencyConflictException();
+  }
+
+  private void reserveKey(Payment payment) {
+    transactionTemplate.executeWithoutResult(transaction -> {
+      Instant now = clock.instant();
+      clearExpiredIdempotencyKey(payment.merchantId(), payment.idempotencyKey(), now);
+      insertPayment(payment);
+      jdbcTemplate.update("INSERT INTO payment_idempotency_keys "
+              + "(merchant_id, idempotency_key, payment_id, expires_at) VALUES (?, ?, ?, ?)",
+          payment.merchantId(), payment.idempotencyKey(), payment.id(),
+          Timestamp.from(now.plus(idempotencyRetention)));
+    });
   }
 
   @Override
-  @Transactional
-  public void save(Payment payment) {
-    int updated = jdbcTemplate.update("UPDATE payments SET status = ?, authorization_in_progress = ?, "
-            + "reversal_attempts = ?, next_reversal_at = ? WHERE id = ? AND merchant_id = ?",
-        payment.status().name(), payment.authorizationInProgress(), payment.reversalAttempts(),
-        timestamp(payment.nextReversalAt()), payment.id(), payment.merchantId());
-    if (updated != 1) {
-      throw new IllegalStateException("Payment disappeared before it could be updated");
-    }
+  public boolean transition(Payment current, Payment next) {
+    return jdbcTemplate.update("UPDATE payments SET status = ?, authorization_in_progress = ?, "
+            + "reversal_attempts = ?, next_reversal_at = ? WHERE id = ? AND merchant_id = ? "
+            + "AND status = ? AND authorization_in_progress = ? AND reversal_attempts = ?",
+        next.status().name(), next.authorizationInProgress(), next.reversalAttempts(),
+        timestamp(next.nextReversalAt()), current.id(), current.merchantId(),
+        current.status().name(), current.authorizationInProgress(),
+        current.reversalAttempts()) == 1;
   }
 
   @Override
@@ -99,17 +108,24 @@ public class PaymentsRepository implements PaymentStore {
   }
 
   @Override
-  @Transactional
-  public void remove(Payment payment) {
-    jdbcTemplate.update("DELETE FROM payments WHERE id = ? AND merchant_id = ?",
-        payment.id(), payment.merchantId());
+  public boolean removeInFlight(Payment payment) {
+    return jdbcTemplate.update("DELETE FROM payments WHERE id = ? AND merchant_id = ? "
+            + "AND status = ? AND authorization_in_progress = TRUE",
+        payment.id(), payment.merchantId(), PaymentStatus.PENDING.name()) == 1;
   }
 
   @Override
-  public List<Payment> findDueReversals(Instant now) {
-    return jdbcTemplate.query("SELECT " + COLUMNS + " FROM payments WHERE status = ? "
-            + "AND authorization_in_progress = FALSE AND next_reversal_at <= ?",
-        PAYMENT_MAPPER, PaymentStatus.PENDING.name(), Timestamp.from(now));
+  public List<Payment> claimDueReversals(Instant now, Instant leaseUntil, int limit) {
+    return transactionTemplate.execute(transaction -> {
+      List<Payment> due = jdbcTemplate.query("SELECT " + COLUMNS + " FROM payments "
+              + "WHERE status = ? AND authorization_in_progress = FALSE AND next_reversal_at <= ? "
+              + "ORDER BY next_reversal_at LIMIT ? FOR UPDATE SKIP LOCKED",
+          PAYMENT_MAPPER, PaymentStatus.PENDING.name(), Timestamp.from(now), limit);
+      due.forEach(payment -> jdbcTemplate.update(
+          "UPDATE payments SET next_reversal_at = ? WHERE id = ?",
+          Timestamp.from(leaseUntil), payment.id()));
+      return due.stream().map(payment -> payment.withNextReversalAt(leaseUntil)).toList();
+    });
   }
 
   @Override

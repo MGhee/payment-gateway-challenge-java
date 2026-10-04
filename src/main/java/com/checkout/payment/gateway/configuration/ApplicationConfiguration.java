@@ -2,6 +2,7 @@ package com.checkout.payment.gateway.configuration;
 
 import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import java.net.URI;
@@ -62,11 +63,21 @@ public class ApplicationConfiguration {
 
   @Bean
   public Bulkhead bankBulkhead(
-      @Value("${bank.bulkhead.max-concurrent-calls:20}") int maxConcurrentCalls) {
+      @Value("${bank.bulkhead.max-concurrent-calls:20}") int maxConcurrentCalls,
+      @Value("${bank.bulkhead.max-wait-duration:500ms}") Duration maxWaitDuration) {
     BulkheadConfig config = BulkheadConfig.custom()
         .maxConcurrentCalls(maxConcurrentCalls)
-        .maxWaitDuration(Duration.ZERO)
+        .maxWaitDuration(maxWaitDuration)
         .build();
     return Bulkhead.of("bank", config);
+  }
+
+  @Bean
+  public BulkheadRegistry merchantBulkheads(
+      @Value("${gateway.merchant-max-concurrent-payments:10}") int maxConcurrentPayments) {
+    return BulkheadRegistry.of(BulkheadConfig.custom()
+        .maxConcurrentCalls(maxConcurrentPayments)
+        .maxWaitDuration(Duration.ZERO)
+        .build());
   }
 }

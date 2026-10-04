@@ -7,6 +7,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -81,6 +82,17 @@ public class CommonExceptionHandler {
     String detail = "This Idempotency-Key was already used for a different payment";
     return ProblemDetails.response(HttpStatus.UNPROCESSABLE_ENTITY, ErrorResponse.of(detail),
         "idempotency-key-reused", detail, null, request);
+  }
+
+  @ExceptionHandler(TooManyConcurrentPaymentsException.class)
+  public ResponseEntity<Object> handleTooManyConcurrentPayments(
+      TooManyConcurrentPaymentsException ex, HttpServletRequest request) {
+    LOG.warn("Payment rejected: {}", ex.getMessage());
+    String detail = "Too many payments in progress for this merchant, please retry shortly";
+    ResponseEntity<Object> response = ProblemDetails.response(HttpStatus.TOO_MANY_REQUESTS,
+        ErrorResponse.of(detail), "too-many-concurrent-payments", detail, null, request);
+    return ResponseEntity.status(response.getStatusCode()).headers(response.getHeaders())
+        .header(HttpHeaders.RETRY_AFTER, "1").body(response.getBody());
   }
 
   // Field errors use the JSON property names the merchant actually sent

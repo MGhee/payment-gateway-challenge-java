@@ -1,6 +1,7 @@
 package com.checkout.payment.gateway.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -11,6 +12,7 @@ import com.checkout.payment.gateway.client.BankClient;
 import com.checkout.payment.gateway.configuration.BankProperties;
 import com.checkout.payment.gateway.enums.PaymentStatus;
 import com.checkout.payment.gateway.exception.AcquiringBankException;
+import com.checkout.payment.gateway.exception.BankCallRejectedException;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import com.checkout.payment.gateway.repository.InMemoryPaymentStore;
@@ -19,6 +21,7 @@ import java.time.Duration;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -98,6 +101,66 @@ class PaymentReversalJobTest {
     verify(bankClient, times(MAX_ATTEMPTS)).reverse(pending.id());
     assertThat(status()).isEqualTo(PaymentStatus.PENDING);
     assertThat(reversals("failed")).isEqualTo(1);
+  }
+
+  @Test
+  void locallyRejectedReversalIsDeferredWithoutUsingAnAttempt() {
+    doThrow(new BankCallRejectedException(new IllegalStateException("circuit open")))
+        .when(bankClient).reverse(pending.id());
+    PaymentReversalJob deferringJob = job(Duration.ofSeconds(10), NOW);
+
+    deferringJob.reversePendingPayments();
+
+    Payment deferred = repository.get(pending.id()).orElseThrow();
+    assertThat(deferred.status()).isEqualTo(PaymentStatus.PENDING);
+    assertThat(deferred.reversalAttempts()).isZero();
+    assertThat(deferred.nextReversalAt()).isEqualTo(NOW.plusSeconds(10));
+    assertThat(reversals("deferred")).isEqualTo(1);
+  }
+
+  @Test
+  void locallyRejectedReversalsNeverEndInManualReconciliation() {
+    doThrow(new BankCallRejectedException(new IllegalStateException("bulkhead full")))
+        .when(bankClient).reverse(pending.id());
+
+    for (int run = 0; run < MAX_ATTEMPTS + 2; run++) {
+      job.reversePendingPayments();
+    }
+
+    verify(bankClient, times(MAX_ATTEMPTS + 2)).reverse(pending.id());
+    assertThat(repository.get(pending.id()).orElseThrow().reversalAttempts()).isZero();
+    assertThat(reversals("failed")).isZero();
+  }
+
+  @Test
+  void paymentBeingReversedIsNotClaimedBySecondWorker() {
+    PaymentReversalJob secondWorker = job(Duration.ZERO, NOW);
+    AtomicBoolean firstCall = new AtomicBoolean(true);
+    doAnswer(call -> {
+      if (firstCall.getAndSet(false)) {
+        secondWorker.reversePendingPayments();
+      }
+      return null;
+    }).when(bankClient).reverse(pending.id());
+
+    job.reversePendingPayments();
+
+    verify(bankClient, times(1)).reverse(pending.id());
+    assertThat(status()).isEqualTo(PaymentStatus.DECLINED);
+  }
+
+  @Test
+  void outcomeRecordedByAnotherWorkerIsNotOverwritten() {
+    doAnswer(call -> {
+      Payment claimed = repository.get(pending.id()).orElseThrow();
+      repository.transition(claimed, claimed.withStatus(PaymentStatus.DECLINED));
+      throw new AcquiringBankException("Service Unavailable");
+    }).when(bankClient).reverse(pending.id());
+
+    job.reversePendingPayments();
+
+    assertThat(status()).isEqualTo(PaymentStatus.DECLINED);
+    assertThat(repository.get(pending.id()).orElseThrow().reversalAttempts()).isZero();
   }
 
   private PaymentStatus status() {

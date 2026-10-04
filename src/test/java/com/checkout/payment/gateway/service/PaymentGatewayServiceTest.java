@@ -17,11 +17,17 @@ import com.checkout.payment.gateway.exception.BankOutcomeUnknownException;
 import com.checkout.payment.gateway.exception.IdempotencyConflictException;
 import com.checkout.payment.gateway.exception.IdempotencyKeyReusedException;
 import com.checkout.payment.gateway.exception.PaymentNotFoundException;
+import com.checkout.payment.gateway.exception.TooManyConcurrentPaymentsException;
 import com.checkout.payment.gateway.model.Payment;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import com.checkout.payment.gateway.repository.InMemoryPaymentStore;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -33,7 +39,7 @@ class PaymentGatewayServiceTest {
   private final InMemoryPaymentStore repository = new InMemoryPaymentStore();
   private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
   private final PaymentGatewayService service =
-      new PaymentGatewayService(repository, bankClient, meterRegistry);
+      new PaymentGatewayService(repository, bankClient, meterRegistry, merchantLimit(10));
   private final String merchantId = "test-merchant";
 
   private final PostPaymentRequest request =
@@ -191,6 +197,61 @@ class PaymentGatewayServiceTest {
   void unknownPaymentIsNotFound() {
     assertThatThrownBy(() -> getPayment(UUID.randomUUID()))
         .isInstanceOf(PaymentNotFoundException.class);
+  }
+
+  @Test
+  void lateBankAnswerDoesNotOverwriteAPaymentTheRecoveryJobTookOver() {
+    when(bankClient.authorize(any(), eq(request))).thenAnswer(call -> {
+      repository.recoverStaleAuthorizations(Instant.MAX, Instant.now());
+      return new BankPaymentResponse(true, "auth-code");
+    });
+
+    Payment payment = processPayment(request, null);
+
+    assertThat(payment.status()).isEqualTo(PaymentStatus.PENDING);
+    assertThat(payment.authorizationInProgress()).isFalse();
+    assertThat(payment.nextReversalAt()).isNotNull();
+    assertThat(getPayment(payment.id())).isEqualTo(payment);
+  }
+
+  @Test
+  void bankFailureAfterARecoveryTakeoverLeavesThePaymentToTheReversalJob() {
+    when(bankClient.authorize(any(), eq(request))).thenAnswer(call -> {
+      repository.recoverStaleAuthorizations(Instant.MAX, Instant.now());
+      throw new AcquiringBankException("Service Unavailable");
+    });
+
+    Payment payment = processPayment(request, null);
+
+    assertThat(payment.status()).isEqualTo(PaymentStatus.PENDING);
+    assertThat(getPayment(payment.id()).nextReversalAt()).isNotNull();
+  }
+
+  @Test
+  void merchantOverItsConcurrencyLimitIsRejectedWithoutAffectingOthers() {
+    PaymentGatewayService limited =
+        new PaymentGatewayService(repository, bankClient, meterRegistry, merchantLimit(1));
+    AtomicBoolean firstCall = new AtomicBoolean(true);
+    when(bankClient.authorize(any(), eq(request))).thenAnswer(call -> {
+      if (firstCall.getAndSet(false)) {
+        assertThatThrownBy(() -> limited.processPayment(request, null, merchantId))
+            .isInstanceOf(TooManyConcurrentPaymentsException.class);
+        assertThat(limited.processPayment(request, null, "other-merchant").status())
+            .isEqualTo(PaymentStatus.AUTHORIZED);
+      }
+      return new BankPaymentResponse(true, "auth-code");
+    });
+
+    limited.processPayment(request, null, merchantId);
+    Payment afterTheFirstCompleted = limited.processPayment(request, null, merchantId);
+
+    assertThat(afterTheFirstCompleted.status()).isEqualTo(PaymentStatus.AUTHORIZED);
+    verify(bankClient, times(3)).authorize(any(), any());
+  }
+
+  private static BulkheadRegistry merchantLimit(int maxConcurrentPayments) {
+    return BulkheadRegistry.of(BulkheadConfig.custom()
+        .maxConcurrentCalls(maxConcurrentPayments).maxWaitDuration(Duration.ZERO).build());
   }
 
   private Payment processPayment(PostPaymentRequest paymentRequest, String idempotencyKey) {

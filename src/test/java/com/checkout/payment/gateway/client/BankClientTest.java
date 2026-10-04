@@ -9,6 +9,7 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
 import com.checkout.payment.gateway.exception.AcquiringBankException;
+import com.checkout.payment.gateway.exception.BankCallRejectedException;
 import com.checkout.payment.gateway.exception.BankOutcomeUnknownException;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import io.github.resilience4j.bulkhead.Bulkhead;
@@ -156,7 +157,9 @@ class BankClientTest {
       assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
         .isInstanceOf(AcquiringBankException.class);
       assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
-        .isInstanceOf(AcquiringBankException.class);
+        .isInstanceOf(BankCallRejectedException.class);
+      assertThatThrownBy(() -> guardedClient.reverse(REFERENCE))
+        .isInstanceOf(BankCallRejectedException.class);
 
       bank.verify();
       }
@@ -173,7 +176,9 @@ class BankClientTest {
         CircuitBreaker.ofDefaults("full-bank"), bulkhead);
 
       assertThatThrownBy(() -> guardedClient.authorize(REFERENCE, request))
-        .isInstanceOf(AcquiringBankException.class);
+        .isInstanceOf(BankCallRejectedException.class);
+      assertThatThrownBy(() -> guardedClient.reverse(REFERENCE))
+        .isInstanceOf(BankCallRejectedException.class);
 
       bulkhead.releasePermission();
       bank.verify();

@@ -37,6 +37,8 @@ services:
   payment_gateway:
     container_name: payment_gateway
     build: .
+    # Covers the two 20s graceful-shutdown phases; Docker's default of 10s would cut payments off
+    stop_grace_period: 50s
     ports:
       - "8090:8090"
       - "127.0.0.1:8091:8091"

@@ -55,6 +55,9 @@ public class PaymentGatewayController {
       content = @Content(schema = @Schema(oneOf = {ErrorResponse.class, ProblemDetail.class})))
   @ApiResponse(responseCode = "422", description = "Idempotency-Key already used for a different "
       + "payment", content = @Content(schema = @Schema(oneOf = {ErrorResponse.class, ProblemDetail.class})))
+  @ApiResponse(responseCode = "429", description = "Too many payments in progress for this "
+      + "merchant; nothing was stored, retry after the Retry-After delay",
+      content = @Content(schema = @Schema(oneOf = {ErrorResponse.class, ProblemDetail.class})))
   @ApiResponse(responseCode = "502", description = "Acquiring bank unavailable; no payment created",
       content = @Content(schema = @Schema(oneOf = {ErrorResponse.class, ProblemDetail.class})))
   public ResponseEntity<PaymentResponse> processPayment(

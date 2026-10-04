@@ -1,6 +1,7 @@
 package com.checkout.payment.gateway.client;
 
 import com.checkout.payment.gateway.exception.AcquiringBankException;
+import com.checkout.payment.gateway.exception.BankCallRejectedException;
 import com.checkout.payment.gateway.exception.BankOutcomeUnknownException;
 import com.checkout.payment.gateway.model.PostPaymentRequest;
 import io.github.resilience4j.bulkhead.Bulkhead;
@@ -38,7 +39,7 @@ public class BankClient {
     try {
       return Bulkhead.decorateSupplier(bulkhead, bankCall).get();
     } catch (CallNotPermittedException | BulkheadFullException e) {
-      throw new AcquiringBankException("Acquiring bank temporarily unavailable", e);
+      throw new BankCallRejectedException(e);
     }
   }
 
@@ -70,7 +71,7 @@ public class BankClient {
     try {
       Bulkhead.decorateRunnable(bulkhead, bankCall).run();
     } catch (CallNotPermittedException | BulkheadFullException e) {
-      throw new AcquiringBankException("Acquiring bank temporarily unavailable", e);
+      throw new BankCallRejectedException(e);
     }
   }
 

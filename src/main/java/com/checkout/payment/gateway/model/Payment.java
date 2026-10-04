@@ -53,6 +53,10 @@ public record Payment(
         amount, idempotencyKey, createdAt, false, attempts, nextAttemptAt);
   }
 
+  public Payment withNextReversalAt(Instant nextAttemptAt) {
+    return withReversalFailure(reversalAttempts, nextAttemptAt);
+  }
+
   // Card number and CVV are never stored, so a retry is matched on the fields we keep
   public boolean matches(PostPaymentRequest request) {
     return cardNumberLastFour.equals(request.cardNumberLastFour())

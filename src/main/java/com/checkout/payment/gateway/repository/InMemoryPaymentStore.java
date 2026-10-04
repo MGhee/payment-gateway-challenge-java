@@ -1,7 +1,9 @@
 package com.checkout.payment.gateway.repository;
 
+import com.checkout.payment.gateway.enums.PaymentStatus;
 import com.checkout.payment.gateway.model.Payment;
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -26,9 +28,20 @@ public class InMemoryPaymentStore implements PaymentStore {
     return Optional.empty();
   }
 
-  @Override
   public void save(Payment payment) {
     payments.put(payment.id(), payment);
+  }
+
+  @Override
+  public synchronized boolean transition(Payment current, Payment next) {
+    Payment stored = payments.get(current.id());
+    if (stored == null || stored.status() != current.status()
+        || stored.authorizationInProgress() != current.authorizationInProgress()
+        || stored.reversalAttempts() != current.reversalAttempts()) {
+      return false;
+    }
+    payments.put(next.id(), next);
+    return true;
   }
 
   @Override
@@ -48,20 +61,33 @@ public class InMemoryPaymentStore implements PaymentStore {
   }
 
   @Override
-  public synchronized void remove(Payment payment) {
+  public synchronized boolean removeInFlight(Payment payment) {
+    Payment stored = payments.get(payment.id());
+    if (stored == null || stored.status() != PaymentStatus.PENDING
+        || !stored.authorizationInProgress()) {
+      return false;
+    }
     payments.remove(payment.id());
     if (payment.idempotencyKey() != null) {
       paymentIdsByIdempotencyKey.remove(key(payment.merchantId(), payment.idempotencyKey()),
           payment.id());
     }
+    return true;
   }
 
   @Override
-  public List<Payment> findDueReversals(Instant now) {
-    return payments.values().stream()
-        .filter(payment -> payment.nextReversalAt() != null
+  public synchronized List<Payment> claimDueReversals(Instant now, Instant leaseUntil,
+      int limit) {
+    List<Payment> claimed = payments.values().stream()
+        .filter(payment -> payment.status() == PaymentStatus.PENDING
+            && !payment.authorizationInProgress() && payment.nextReversalAt() != null
             && !payment.nextReversalAt().isAfter(now))
+        .sorted(Comparator.comparing(Payment::nextReversalAt))
+        .limit(limit)
+        .map(payment -> payment.withNextReversalAt(leaseUntil))
         .toList();
+    claimed.forEach(payment -> payments.put(payment.id(), payment));
+    return claimed;
   }
 
   @Override
