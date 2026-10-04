@@ -45,7 +45,7 @@ Each is explained under [Design decisions and assumptions](#design-decisions-and
 
 ## Running it
 
-**Requirements:** JDK 17 and Docker.
+**Requirements:** Docker to run it; JDK 17 as well to build and run the tests.
 
 Compose reads local-only credentials from [.env](.env), so `docker compose up --build` works as is. Variables set in your shell override that file; use strong secrets outside local development. The admin key provisions merchant keys and is not used for payment requests.
 
@@ -64,14 +64,37 @@ The gateway listens on **http://localhost:8090**. Interactive API docs (Swagger 
 | 2, 4, 6, 8 | Declined |
 | 0 | Bank error |
 
-```powershell
-$adminHeaders = @{ "X-Gateway-Admin-Key" = "local-only-admin-key" }
-$merchant = Invoke-RestMethod -Method Post `
-  -Uri http://localhost:8090/admin/merchants/demo/api-keys -Headers $adminHeaders
+Every payment request needs a merchant key, so provision one first with the admin key. In Bash (Git Bash, macOS or Linux):
 
-curl.exe -i -X POST http://localhost:8090/v1/payments `
-  -H "X-API-Key: $($merchant.api_key)" -H "Content-Type: application/json" `
-  --data-raw '{"card_number":"2222405343248877","expiry_month":4,"expiry_year":2030,"currency":"GBP","amount":100,"cvv":"123"}'
+```bash
+KEY=$(curl -s -X POST -H 'X-Gateway-Admin-Key: local-only-admin-key' \
+  http://localhost:8090/admin/merchants/demo/api-keys | sed -E 's/.*"api_key":"([^"]+)".*/\1/')
+
+curl -i -X POST http://localhost:8090/v1/payments \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"card_number":"2222405343248877","expiry_month":4,"expiry_year":2030,"currency":"GBP","amount":100,"cvv":"123"}'
+```
+
+In PowerShell (Windows PowerShell 5.1 strips the quotes from JSON passed to `curl.exe`, so this uses `Invoke-RestMethod`):
+
+```powershell
+$merchant = Invoke-RestMethod -Method Post -Uri http://localhost:8090/admin/merchants/demo/api-keys `
+  -Headers @{ "X-Gateway-Admin-Key" = "local-only-admin-key" }
+
+$body = @{ card_number = "2222405343248877"; expiry_month = 4; expiry_year = 2030
+           currency = "GBP"; amount = 100; cvv = "123" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8090/v1/payments `
+  -Headers @{ "X-API-Key" = $merchant.api_key } -ContentType "application/json" -Body $body
+```
+
+Swagger UI also works: use **Authorize** to enter the admin key and the merchant key, then try each endpoint.
+
+The simulator always answers in time. To see an unknown outcome (`202 Pending`), start a second gateway on port 8095 whose bank calls time out after 1 ms, and send the payment there:
+
+```bash
+docker compose run -d --rm --name gateway_timeout -p 8095:8090 -e BANK_READ_TIMEOUT=1ms payment_gateway
+# ...send payments to http://localhost:8095/v1/payments, then:
+docker stop gateway_timeout
 ```
 
 ## API
